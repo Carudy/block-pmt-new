@@ -1,0 +1,32 @@
+# --- Binaries & build artifacts ---
+block_ori_exe
+blockexe
+*.exe
+*.o
+a.out
+
+# --- Databases ---
+*_blockchain_db
+/record/triedb/
+
+# --- Logs ---
+/log/
+/process_logs/
+
+# --- Datasets (large CSV inputs) ---
+*.csv
+
+# --- METIS build/intermediate artifacts ---
+/METIS/a.out
+/METIS/test
+/METIS/partition
+/METIS/graph.txt
+/METIS/partition.txt
+/METIS/.ipynb_checkpoints/
+
+# --- Generated archives ---
+*.zip
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
