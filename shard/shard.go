@@ -43,7 +43,6 @@ func NewNode() *Node {
 	account.Lock_Acc = make(map[string]bool)
 	account.Credit = make(map[string]*big.Int)
 	account.Loan = make(map[string]*big.Int)
-	account.PayerTxCount = make(map[string]int)
 
 	//将初始账户的映射弄好
 	for _, address := range params.Init_addrs {

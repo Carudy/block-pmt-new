@@ -340,7 +340,6 @@ func (p *Pbft) mpAndSend(isdelete map[string]string, anns []*core.TXann, cAps ma
 
 		// 银行机制：取出该账户在迁移窗口内累计的贷款，并清理信用/贷款记录
 		loan := big.NewInt(0)
-		numTxs := 0
 		if params.Config.EnableBankMechanism && !params.Config.Lock_Acc_When_Migrating {
 			account.LoanLock.Lock()
 			if l := account.Loan[ann.Address]; l != nil {
@@ -352,11 +351,6 @@ func (p *Pbft) mpAndSend(isdelete map[string]string, anns []*core.TXann, cAps ma
 			account.CreditLock.Lock()
 			delete(account.Credit, ann.Address)
 			account.CreditLock.Unlock()
-
-			account.PayerTxCountLock.Lock()
-			numTxs = account.PayerTxCount[ann.Address]
-			delete(account.PayerTxCount, ann.Address)
-			account.PayerTxCountLock.Unlock()
 		}
 
 		if change.BitLen() == 0 && loan.BitLen() == 0 {
@@ -379,7 +373,6 @@ func (p *Pbft) mpAndSend(isdelete map[string]string, anns []*core.TXann, cAps ma
 			ns := &core.TXns{Txann: ann, MPann: proofDB1, State: state, MPstate: proofDB2, Address: ann.Address}
 			ns.Change = new(big.Int).Set(change)
 			ns.Debt = new(big.Int).Set(loan)
-			ns.NumTxs = numTxs
 
 			// 5. 将账户的余额变化放入列表，待会发送
 			if _, ok := nss[params.ShardTableInt2Str[ann.ToshardID]]; !ok {

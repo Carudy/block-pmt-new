@@ -69,6 +69,9 @@ type Tx_pool struct {
 
 	// 用来收集ANNOUNCE后有关迁入账户的relay交易，由Coming_Lock控制
 	Coming_TX_Pools map[string][]*Transaction
+
+	// 用来按迁出账户聚合 pending 借款（payer 聚合模式）
+	Borrow_Pool map[string]*TXborrow
 }
 
 func NewTxPool() *Tx_pool {
@@ -80,6 +83,7 @@ func NewTxPool() *Tx_pool {
 		Outing_After_Announce_TX_Pools:  make(map[string][]*Transaction),
 		Locking_TX_Pools:                make(map[string][]*Transaction),
 		Coming_TX_Pools:                 make(map[string][]*Transaction),
+		Borrow_Pool:                     make(map[string]*TXborrow),
 	}
 	// heap.Init(&pool.Heap)
 
@@ -165,21 +169,14 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 	config := params.Config
 	fmt.Printf("left_count: %v\n", left_count)
 	tx_cnt := left_count
-	loc := -1
 	pool.Lock.Lock()
-	if len(pool.Queue) < left_count {
-		tx_cnt = len(pool.Queue)
-	}
 	txs = make([]*Transaction, 0)
+	// newQueue 保存本区块未打包的普通交易（以及未被聚合/锁定的交易），保持原有顺序
+	newQueue := make([]*Transaction, 0, len(pool.Queue))
 	// 银行机制：记录本区块内已为迁移账户预留的信用额度，避免单个区块内超借
 	reserved := make(map[string]*big.Int)
 	// txs = append(txs, pool.Queue[0:tx_cnt]...)
-	for k, v := range pool.Queue {
-		if tx_cnt == 0 {
-			break
-		}
-		loc = k
-
+	for _, v := range pool.Queue {
 		from, to := hex.EncodeToString(v.Sender), hex.EncodeToString(v.Recipient)
 		// 不是自己分片的交易,直接不管了
 		account.Account2ShardLock.Lock()
@@ -247,16 +244,27 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			account.Outing_Acc_Before_Announce_Lock.Unlock()
 
 			if isOuting {
-				// 银行机制：迁移账户的付款由银行代付，只要信用额度足够就放行
+				// 银行机制：迁移账户的付款由银行代付，只要信用额度足够就聚合为借款
 				admit := false
 				if config.EnableBankMechanism {
 					admit = canBorrow(from, v.Value, reserved)
 					if admit {
-						// 放行，落到下方 txs = append(txs, v)，并预留额度
+						// 预留额度（避免同一区块内超借）
 						if reserved[from] == nil {
 							reserved[from] = big.NewInt(0)
 						}
 						reserved[from].Add(reserved[from], v.Value)
+
+						// 聚合：不加入普通交易 txs，而是累积到 Borrow_Pool
+						b := pool.Borrow_Pool[from]
+						if b == nil {
+							b = &TXborrow{Address: from, TotalValue: big.NewInt(0), NumTxs: 0, Credits: make([]*CreditEntry, 0)}
+							pool.Borrow_Pool[from] = b
+						}
+						b.TotalValue.Add(b.TotalValue, v.Value)
+						b.NumTxs++
+						b.Credits = append(b.Credits, &CreditEntry{Recipient: v.Recipient, Value: new(big.Int).Set(v.Value)})
+						continue // 不占用普通交易槽位
 					}
 				}
 				if !admit {
@@ -277,14 +285,30 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			}
 		}
 
-		txs = append(txs, v)
-		tx_cnt--
+		if tx_cnt > 0 {
+			txs = append(txs, v)
+			tx_cnt--
+		} else {
+			newQueue = append(newQueue, v)
+		}
 	}
-	pool.Queue = pool.Queue[loc+1:]
+	pool.Queue = newQueue
 	queueLen = len(pool.Queue)
 
 	pool.Lock.Unlock()
 	return
+}
+
+// FetchBorrows2Pack 取走当前按账户聚合好的借款条目，并清空 Borrow_Pool。
+func (pool *Tx_pool) FetchBorrows2Pack() []*TXborrow {
+	pool.Lock.Lock()
+	borrows := make([]*TXborrow, 0, len(pool.Borrow_Pool))
+	for _, b := range pool.Borrow_Pool {
+		borrows = append(borrows, b)
+	}
+	pool.Borrow_Pool = make(map[string]*TXborrow)
+	pool.Lock.Unlock()
+	return borrows
 }
 
 // canBorrow 判断迁移账户 addr 在已借款 loan、本区块预留 reserved 的基础上，

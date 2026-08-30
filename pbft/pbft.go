@@ -135,7 +135,7 @@ func NewLog(shardID string) {
 	}
 	// defer csvFile.Close()
 	blocklog = csv.NewWriter(csvFile)
-	blocklog.Write([]string{"timestamp", "blockHeight", "tx_total", "tx_normal", "tx_relay_sender", "tx_relay_receiver", "tx_committed", "pbfttime", "mig1", "mig2", "ann", "ns", "locked_txs"})
+	blocklog.Write([]string{"timestamp", "blockHeight", "tx_total", "tx_normal", "tx_relay_sender", "tx_relay_receiver", "tx_committed", "pbfttime", "mig1", "mig2", "ann", "ns", "borrow", "borrow_tx", "real_tx_committed", "locked_txs"})
 	blocklog.Flush()
 
 	csvFile, err = os.Create("./log/" + shardID + "_blockexetime.csv")
@@ -187,7 +187,7 @@ func NewLog(shardID string) {
 			log.Panic(err)
 		}
 		banklog = csv.NewWriter(csvFile)
-		banklog.Write([]string{"blockHeight", "bank_balance", "active_loans", "settled_out", "settled_in"})
+		banklog.Write([]string{"blockHeight", "bank_balance", "active_loans", "settled_out", "settled_in", "real_tx_committed"})
 		banklog.Flush()
 	}
 }
@@ -482,15 +482,13 @@ func (p *Pbft) handleCommit(content []byte) {
 					}
 
 					tx_total := len(block.Transactions)
-					// 银行机制：NSs 里每个 TXns 聚合了若干笔原始 payer 交易，这里统计原始笔数
-					ns_tx_total := 0
-					for _, ns := range block.NSs {
-						ns_tx_total += ns.NumTxs
-					}
-					// ns 统计列：银行机制下统计原始 payer 交易笔数，否则维持“新状态账户数”
-					ns_count := len(block.NSs)
-					if params.Config.EnableBankMechanism {
-						ns_count = ns_tx_total
+					// 银行机制：聚合借款的条目数与原始 payer 笔数（用于 real_tx 统计）
+					borrow_num := len(block.TXborrows)
+					borrow_tx := 0
+					for _, b := range block.TXborrows {
+						if b != nil {
+							borrow_tx += b.NumTxs
+						}
 					}
 					relayCount := 0
 					//已上链交易集
@@ -665,6 +663,11 @@ func (p *Pbft) handleCommit(content []byte) {
 						go p.TryRelay(relaytxs, block.Transactions, st2, p.sequenceID)
 					}
 
+					// 银行机制：把聚合借款里的远程收款人 relay 出去
+					if len(block.TXborrows) != 0 {
+						go p.TryRelayBorrows(block.TXborrows)
+					}
+
 					if !params.Config.Stop_When_Migrating && !params.Config.Fail {
 						// 发送迁出账户给对应分片
 						if params.Config.Cross_Chain {
@@ -679,7 +682,7 @@ func (p *Pbft) handleCommit(content []byte) {
 					}
 
 					migend := time.Now().UnixMicro()
-					s := fmt.Sprintf("%v %v %v %v %v %v %v", block.Header.Number, tx_total, len(block.TXmig1s)+len(block.TXmig2s)+len(block.Anns)+ns_count, migend-mig_begin, len(block.Anns), jiaoyichitime, totaltime)
+					s := fmt.Sprintf("%v %v %v %v %v %v %v", block.Header.Number, tx_total, len(block.TXmig1s)+len(block.TXmig2s)+len(block.Anns)+len(block.NSs), migend-mig_begin, len(block.Anns), jiaoyichitime, totaltime)
 					blockexetimelog.Write(strings.Split(s, " "))
 					blockexetimelog.Flush()
 
@@ -702,13 +705,14 @@ func (p *Pbft) handleCommit(content []byte) {
 					txmig1log.Flush()
 					txmig2log.Flush()
 					// ctxlog.Flush()
-					s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), ns_count, locked_cnt)
+					real_tx_committed := len(commit_txs) + borrow_tx
+					s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, real_tx_committed, locked_cnt)
 					blocklog.Write(strings.Split(s, " "))
 					blocklog.Flush()
 
 					commitTX_numofNS := Txs_and_Num_of_New_State{
 						Txs:              commit_txs,
-						BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + ns_count + len(block.Transactions),
+						BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.Transactions),
 						Num_of_New_State: len(block.NSs),
 					}
 					//主节点向客户端发送已确认上链的交易集
@@ -1087,6 +1091,59 @@ func (p *Pbft) TryRelay2(relaytxs []*core.TXrelay) {
 			}
 
 			// fmt.Printf("正在向分片%v的主节点发送relay交易\n", k)
+			message := jointMessage(cRelay, bc)
+			go utils.TcpDial(message, target_leader)
+		}
+	}
+}
+
+// TryRelayBorrows 把聚合借款里的远程收款人 relay 到对应分片（本地收款人已在状态树里入账）。
+func (p *Pbft) TryRelayBorrows(borrows []*core.TXborrow) {
+	if len(borrows) == 0 {
+		return
+	}
+	config := params.Config
+	selfShardID := params.ShardTable[config.ShardID]
+	relaypool := make([][]*core.TXrelay, config.Shard_num)
+	for _, b := range borrows {
+		if b == nil {
+			continue
+		}
+		senderBytes, _ := hex.DecodeString(b.Address)
+		for _, c := range b.Credits {
+			if c == nil || c.Value == nil {
+				continue
+			}
+			toShard := account.Addr2Shard(hex.EncodeToString(c.Recipient))
+			if toShard == selfShardID {
+				continue // 本地收款人
+			}
+			relayTx := &core.Transaction{
+				Sender:    senderBytes,
+				Recipient: c.Recipient,
+				Value:     new(big.Int).Set(c.Value),
+				IsRelay:   true,
+			}
+			relayTx.TxHash = relayTx.Hash()
+			relaypool[toShard] = append(relaypool[toShard], &core.TXrelay{Txcs: relayTx})
+		}
+	}
+
+	for k, v := range params.NodeTable {
+		if k == config.ShardID {
+			continue
+		}
+		txs := relaypool[params.ShardTable[k]]
+		if len(txs) != 0 {
+			target_leader := v["N0"]
+			r := Relay{
+				Txs:     txs,
+				ShardID: config.ShardID,
+			}
+			bc, err := json.Marshal(r)
+			if err != nil {
+				log.Panic(err)
+			}
 			message := jointMessage(cRelay, bc)
 			go utils.TcpDial(message, target_leader)
 		}

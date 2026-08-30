@@ -4,6 +4,10 @@
 # Sets num_shards and num_nodes variables and starts all nodes
 ./kill_block_ori_exe.sh  # Kill any existing block_ori_exe processes
 ./clean.sh
+
+# rebuild
+go build -o block_ori_exe .
+
 # Configuration variables - edit these as needed
 num_shards=2      # Number of shards (S0, S1, S2, S3)
 num_nodes=16       # Number of nodes per shard (this branch runs one node per shard)

@@ -18,7 +18,6 @@ type TXns struct {
 	Address string   `json:"address"`
 	Change  *big.Int `json:"value"`
 	Debt    *big.Int `json:"debt"`
-	NumTxs  int      `json:"numtxs"`
 }
 
 // Encode transaction for storing

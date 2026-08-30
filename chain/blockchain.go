@@ -148,7 +148,7 @@ func (bc *BlockChain) AddBlock(block *core.Block) map[string]*big.Int {
 	}
 
 	updatetree := time.Now().UnixMilli()
-	stateroothash, outbalance := bc.getUpdatedTreeOfState(1, block.Header.Number, block.Transactions, block.TXmig1s, block.TXmig2s, block.Anns, block.NSs, block.TXsettles)
+	stateroothash, outbalance := bc.getUpdatedTreeOfState(1, block.Header.Number, block.Transactions, block.TXmig1s, block.TXmig2s, block.Anns, block.NSs, block.TXborrows, block.TXsettles)
 	if !bytes.Equal(block.Header.StateRoot, stateroothash) {
 		log.Panicf("二者不等，Ins长度为%v\n", len(block.TXmig2s))
 	}
@@ -322,22 +322,28 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 		}
 	}
 
+	// 银行机制：取走聚合好的借款条目（payer 聚合模式）
+	borrows := []*core.TXborrow{}
+	if params.Config.EnableBankMechanism {
+		borrows = bc.Tx_pool.FetchBorrows2Pack()
+	}
+
 	blockHeader := &core.BlockHeader{
 		ParentHash: bc.CurrentBlock.Hash,
 		Number:     bc.CurrentBlock.Header.Number + 1,
 		Time:       uint64(time.Now().Unix()),
 	}
 
-	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, settles)
+	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles)
 
 	//普通交易树
 	block.Header.TxHash = GetTxTreeRoot(txs)
 
 	//迁移交易树
-	block.Header.MigHash = GetMigTreeRoot(mig1s, mig2s, anns, nss, settles)
+	block.Header.MigHash = GetMigTreeRoot(mig1s, mig2s, anns, nss, borrows, settles)
 
 	//0 代表不更新到磁盘
-	block.Header.StateRoot, _ = bc.getUpdatedTreeOfState(0, blockHeader.Number, txs, mig1s, mig2s, anns, nss, settles)
+	block.Header.StateRoot, _ = bc.getUpdatedTreeOfState(0, blockHeader.Number, txs, mig1s, mig2s, anns, nss, borrows, settles)
 
 	block.Hash = block.GetHash()
 
@@ -365,7 +371,7 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 }
 
 // 输出更新后的状态树 以及 要迁出的账户的余额
-func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.Transaction, mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, settles []*core.TXsettle) ([]byte, map[string]*big.Int) {
+func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.Transaction, mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle) ([]byte, map[string]*big.Int) {
 	// build trie from the triedb (in disk)
 	start_execute := time.Now().UnixMicro()
 	st, err := trie.New(trie.TrieID(common.BytesToHash(bc.CurrentBlock.Header.StateRoot)), bc.Triedb)
@@ -431,10 +437,6 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 					}
 					account.Loan[addr].Add(account.Loan[addr], tx.Value)
 					account.LoanLock.Unlock()
-
-					account.PayerTxCountLock.Lock()
-					account.PayerTxCount[addr]++
-					account.PayerTxCountLock.Unlock()
 				}
 			} else {
 				sender_state.Balance.Sub(sender_state.Balance, tx.Value)
@@ -571,6 +573,49 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 		}
 		nstime = time.Now().UnixMicro() - nsstart
 
+		// 银行机制：处理聚合的借款（源分片：银行代付、记贷款、给本地收款人入账）
+		for _, v := range borrows {
+			if v == nil || v.TotalValue == nil || v.TotalValue.Sign() == 0 {
+				continue
+			}
+			// 银行扣款
+			bankAddr := account.BankAddrBytes(selfShardID)
+			bank_state_enc := st.Get(bankAddr)
+			if bank_state_enc == nil {
+				log.Panic()
+			}
+			bank_state := account.DecodeAccountState(bank_state_enc)
+			bank_state.Balance.Sub(bank_state.Balance, v.TotalValue)
+			st.Update(bankAddr, bank_state.Encode())
+
+			// 记录贷款
+			if commit == 1 {
+				account.LoanLock.Lock()
+				if account.Loan[v.Address] == nil {
+					account.Loan[v.Address] = big.NewInt(0)
+				}
+				account.Loan[v.Address].Add(account.Loan[v.Address], v.TotalValue)
+				account.LoanLock.Unlock()
+			}
+
+			// 给本地收款人入账（远程收款人在 commit1 里 relay）
+			for _, c := range v.Credits {
+				if c == nil || c.Value == nil {
+					continue
+				}
+				r_state_enc := st.Get(c.Recipient)
+				if r_state_enc == nil {
+					continue
+				}
+				r_state := account.DecodeAccountState(r_state_enc)
+				if r_state.Location != selfShardID {
+					continue
+				}
+				r_state.Balance.Add(r_state.Balance, c.Value)
+				st.Update(c.Recipient, r_state.Encode())
+			}
+		}
+
 		// 银行机制：应用跨分片银行结算（本分片是 From 则扣款，是 To 则收款）
 		for _, v := range settles {
 			if v == nil || v.Amount == nil || (v.FromShardID != selfShardID && v.ToShardID != selfShardID) {
@@ -638,8 +683,9 @@ func (bc *BlockChain) NewGenesisBlock() *core.Block {
 	mig2s := make([]*core.TXmig2, 0)
 	anns := make([]*core.TXann, 0)
 	nss := make([]*core.TXns, 0)
+	borrows := make([]*core.TXborrow, 0)
 	settles := make([]*core.TXsettle, 0)
-	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, settles)
+	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles)
 
 	// build a new trie database by db
 	triedb := trie.NewDatabaseWithConfig(bc.db, &trie.Config{
@@ -752,7 +798,7 @@ func GetTxTreeRoot(txs []*core.Transaction) []byte {
 }
 
 // Get the transaction root, this root can be used to check the transactions
-func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, settles []*core.TXsettle) []byte {
+func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle) []byte {
 	// use a memory trie database to do this, instead of disk database
 	triedb := trie.NewDatabase(rawdb.NewMemoryDatabase())
 	transactionTree := trie.NewEmpty(triedb)
@@ -766,6 +812,9 @@ func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXa
 		transactionTree.Update(tx.Hash(), tx.Encode())
 	}
 	for _, tx := range nss {
+		transactionTree.Update(tx.Hash(), tx.Encode())
+	}
+	for _, tx := range borrows {
 		transactionTree.Update(tx.Hash(), tx.Encode())
 	}
 	for _, tx := range settles {

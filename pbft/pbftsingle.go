@@ -64,15 +64,13 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			}
 
 			tx_total := len(block.Transactions)
-			// 银行机制：NSs 里每个 TXns 聚合了若干笔原始 payer 交易，这里统计原始笔数
-			ns_tx_total := 0
-			for _, ns := range block.NSs {
-				ns_tx_total += ns.NumTxs
-			}
-			// ns 统计列：银行机制下统计原始 payer 交易笔数，否则维持“新状态账户数”
-			ns_count := len(block.NSs)
-			if params.Config.EnableBankMechanism {
-				ns_count = ns_tx_total
+			// 银行机制：聚合借款的条目数与原始 payer 笔数（用于 real_tx 统计）
+			borrow_num := len(block.TXborrows)
+			borrow_tx := 0
+			for _, b := range block.TXborrows {
+				if b != nil {
+					borrow_tx += b.NumTxs
+				}
 			}
 			relayCount := 0
 			//已上链交易集
@@ -259,6 +257,11 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 				go p.TryRelay(relaytxs, block.Transactions, st2, p.sequenceID)
 			}
 
+			// 银行机制：把聚合借款里的远程收款人 relay 出去
+			if len(block.TXborrows) != 0 {
+				go p.TryRelayBorrows(block.TXborrows)
+			}
+
 			if !params.Config.Stop_When_Migrating && !params.Config.Fail {
 				// 发送迁出账户给对应分片
 				if params.Config.Cross_Chain {
@@ -288,7 +291,7 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 				}
 			}
 			migend := time.Now().UnixMicro()
-			s := fmt.Sprintf("%v %v %v %v %v %v %v", block.Header.Number, tx_total, len(block.TXmig1s)+len(block.TXmig2s)+len(block.Anns)+ns_count, migend-mig_begin, len(block.Anns), jiaoyichitime, totaltime)
+			s := fmt.Sprintf("%v %v %v %v %v %v %v", block.Header.Number, tx_total, len(block.TXmig1s)+len(block.TXmig2s)+len(block.Anns)+len(block.NSs), migend-mig_begin, len(block.Anns), jiaoyichitime, totaltime)
 			blockexetimelog.Write(strings.Split(s, " "))
 			blockexetimelog.Flush()
 
@@ -311,11 +314,19 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			txmig1log.Flush()
 			txmig2log.Flush()
 
+			// 真实处理交易数：普通 commit 交易 + 聚合 payer 借款的原始笔数（仅用于吞吐统计，不影响运行逻辑）
+			real_tx_committed := len(commit_txs) + borrow_tx
+
 			// 银行机制：记录银行余额、活跃贷款数与跨分片结算
 			if params.Config.EnableBankMechanism {
 				selfShardID := params.ShardTable[params.Config.ShardID]
 				bankBalance := big.NewInt(0)
-				if enc := st1.Get(account.BankAddrBytes(selfShardID)); enc != nil {
+				// 使用独立 trie 读取银行余额，避免与 handleAnns 中异步 mpAndSend 对 st1 的并发读冲突
+				bankTrie, err := trie.New(trie.TrieID(common.BytesToHash(block.Header.StateRoot)), p.Node.CurChain.Triedb)
+				if err != nil {
+					log.Panic(err)
+				}
+				if enc := bankTrie.Get(account.BankAddrBytes(selfShardID)); enc != nil {
 					bs := account.DecodeAccountState(enc)
 					bankBalance.Set(bs.Balance)
 				}
@@ -336,18 +347,18 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 					}
 				}
 
-				banklog.Write([]string{fmt.Sprintf("%v", block.Header.Number), bankBalance.String(), fmt.Sprintf("%v", activeLoans), settledOut.String(), settledIn.String()})
+				banklog.Write([]string{fmt.Sprintf("%v", block.Header.Number), bankBalance.String(), fmt.Sprintf("%v", activeLoans), settledOut.String(), settledIn.String(), fmt.Sprintf("%v", real_tx_committed)})
 				banklog.Flush()
 			}
 
 			// ctxlog.Flush()
-			s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), ns_count, locked_cnt)
+			s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, real_tx_committed, locked_cnt)
 			blocklog.Write(strings.Split(s, " "))
 			blocklog.Flush()
 
 			commitTX_numofNS := Txs_and_Num_of_New_State{
 				Txs:              commit_txs,
-				BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + ns_count + len(block.Transactions),
+				BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.Transactions),
 				Num_of_New_State: len(block.NSs),
 			}
 			//主节点向客户端发送已确认上链的交易集

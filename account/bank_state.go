@@ -21,11 +21,6 @@ var LoanLock sync.Mutex
 // 正在迁出账户从银行借出的金额 = 迁移窗口内由银行代为支付的出账总和。
 var Loan map[string]*big.Int
 
-var PayerTxCountLock sync.Mutex
-
-// 正在迁出账户在迁移窗口内由银行代付的 payer 交易数量（用于统计原始交易笔数）。
-var PayerTxCount map[string]int
-
 // BankAddrString 返回指定分片银行账户的地址字符串（40 个十六进制字符，20 字节）。
 // 前缀固定为 36 个 '0' + "ba"，与普通账户地址（来自数据集）不冲突。
 func BankAddrString(shardID int) string {
