@@ -1,6 +1,68 @@
-# Implementation Plan — Bank Mechanism (Borrow-during-Migration) for Block-Fine-Tune
+# Implementation Plan — Schema (FTL / Caravan / Preempt) for Block-Fine-Tune
 
-## 1. Objective
+> 2024-xx 更新：全局用一个 `schema` 参数控制三种方案，取代原来的 `EnableBankMechanism` 等银行机制开关。
+> 旧“银行机制”设计（本文件下方 §1 之后的部分）仍是 preempt 的实现蓝本，控制点统一改由 `Schema` 派生。
+>
+> 三种方案的**演进顺序**为 `ftl -> caravan -> preempt`。当前仓库：ftl 是基线（bank 关闭路径），
+> preempt 已实现；**caravan 是尚缺的中间环节**，需在现有 ftl 迁移流程上补充“目的分片打包前聚合”这一段。
+
+## 0. Schema 架构（当前阶段）
+
+### 0.1 三种方案（`params.Config.Schema`：`"ftl"` / `"caravan"` / `"preempt"`）
+
+- **ftl（Fine-tuned Lock，基线）**：迁移中锁住迁移账户的 payer 交易（sender 为迁移账户、需扣余额的交易），
+  放行 payee 交易（只加余额）；迁移结束后，被锁 payer 交易注入目的分片交易池并 unlock，随后按普通交易打包执行。
+  迁移/注入/打包各环节与旧 `EnableBankMechanism=false` 完全一致。
+- **preempt（银行代付）**：迁移中由源分片把迁移账户的 payer 交易聚合成借款（`TXborrow`），银行直接付给 payee，
+  迁移完成后账户在目的分片还款（`TXns.Debt`）并经 `TXsettle` 跨分片结算。
+- **caravan**：迁移流程与 ftl **完全一致**（锁、迁移、注入、payee 处理都不改），唯一改动在
+  “迁移完成、payer 交易注入目的分片并 unlock 之后”：目的分片矿工在打包前，把同一迁移账户的多笔合法 payer 交易
+  按 nonce 前缀贪心聚合成**一笔“单账户→多输出”交易**再执行（一次合并扣减 + 每个收款人一次入账，只占 1 个块槽位）。
+  ——即 ftl 与 preempt 之间的中间档：ftl 在迁移窗口“不做”，preempt 在迁移窗口“让银行做”，caravan 在迁移完成后
+  “由目的分片做（但压缩槽位）”。
+
+### 0.2 代码控制点（已完成重构）
+
+- `params/config.go`：新增 `Schema` 字段与 `SchemaFTL/SchemaCaravan/SchemaPreempt` 常量，删除 `EnableBankMechanism`
+  及未使用的 `BankInterestRate/MaxLoanPerAccount/LoanRepaymentPeriod`（保留 `BankInitialBalance`，仅 preempt 用）。
+  提供方法 `IsFTL()/IsCaravan()/IsPreempt()`。默认 `SchemaPreempt`。
+- 所有原 `*.EnableBankMechanism` 判断改为 `*.IsPreempt()`。preempt 特有路径（TXborrow 聚合、Credit/Loan、
+  TXsettle、bank 账户、`_bank.csv`）仅当 `IsPreempt()` 才走；ftl/caravan 走 FTL 基线路径。
+
+## 0.3 Caravan 实现计划（分阶段）
+
+**阶段 1（schema 重构，已完成）**：见 §0.2。
+
+**阶段 2（FTL 基线）**：`Schema=ftl` 即 bank 关闭路径，行为同改造前。（待用 `Schema=ftl` 跑一次做对比基线）
+
+**阶段 3（标记“迁移完成、已 unlock 的 payer 交易”，已完成）**：
+- `core/transaction.go`：`Transaction` 新增 `FromMigration bool`（仅内存标记，不参与 tx 哈希）。
+- `pbft/pbft.go → handleChangesAndPendings`（半锁路径）与 `pbft/PBFTforMigrate.go → handleBalancesAndPendings`
+  （epoch 路径）：当 `IsCaravan()` 且 pending 交易 `sender == 该迁入账户` 时置 `FromMigration = true`。
+
+**阶段 4（目的分片打包前聚合 TXcaravan，已完成）**：
+- `core/caravan.go`：`TXcaravan{Address, TotalValue, NumTxs, Outputs []*CreditEntry}` + Encode/Decode/Hash。
+- `core/block.go`：`Block` 新增 `TXcaravans` 字段并纳入 `NewBlock`/gob 编解码；`PrintBlock` 输出条目数。
+- `core/txpool.go`：`Tx_pool` 新增 `Caravan_Pool`；`FetchTxs2Pack` 中当 `IsCaravan() && v.FromMigration` 时
+  按 sender 聚合进 `Caravan_Pool`（`continue`，不占普通槽位）；新增 `FetchCaravans2Pack()` 取走并清空。
+- `chain/blockchain.go`：`GenerateBlock` 取走 caravans 并传入 `NewBlock`/`GetMigTreeRoot`/`getUpdatedTreeOfState`；
+  `getUpdatedTreeOfState` 执行：`a.Balance -= TotalValue`（一次），每个本地收款人各入账一次（远程收款人跳过）。
+- `pbft/pbft.go`：新增 `TryRelayCaravans`（仿 `TryRelayBorrows`），把跨分片收款人 relay 出去；
+  `commit1`/`handleCommit` 在打包后调用。
+- 计数：`_block.csv` 新增 `caravan`、`caravan_tx` 列；`real_tx_committed = tx_committed + borrow_tx + caravan_tx`。
+- 单测：`core/caravan_test.go`（聚合/不聚合/编解码往返）。
+
+**阶段 5（对比实验 & 指标，待做）**：`Schema` 依次取 `ftl / caravan / preempt` 各跑一次，对比目的分片
+`_queueLen.csv`、`_block.csv` 的 `real_tx_committed`；`zip_res_ft.sh` 按 schema 输出 `res_finetune/res_caravan/res_preempt.zip`。
+
+### 0.4 已确认的口径（lab 确认）
+
+1. **排序依据**：直接用交易在目的分片交易池中的到达顺序（FTL 重新注入后仍保持原数据集顺序），不引入显式 nonce。
+2. **余额**：账户为无限余额，整批纳入（不做“余额不足前缀截断”）；实现中仍保留一次合并扣减的语义。
+3. **计数**：一个 `TXcaravan` 条目在 `_block.csv` 计 1 条（`caravan`），其 `NumTxs` 计入 `caravan_tx`；
+   `real_tx_committed = tx_committed + borrow_tx + caravan_tx`。
+
+## 1. Objective（旧：银行机制 Preempt 设计）
 
 Add an optional **bank mechanism** on top of the existing Fine-tuned Lock protocol, so that an account that is
 migrating out of a shard can keep **paying** (sender-side transactions) instead of having its payer

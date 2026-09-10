@@ -72,6 +72,9 @@ type Tx_pool struct {
 
 	// 用来按迁出账户聚合 pending 借款（payer 聚合模式）
 	Borrow_Pool map[string]*TXborrow
+
+	// 用来按迁移账户聚合“迁移完成后注入”的 payer 交易（Caravan 模式）
+	Caravan_Pool map[string]*TXcaravan
 }
 
 func NewTxPool() *Tx_pool {
@@ -84,6 +87,7 @@ func NewTxPool() *Tx_pool {
 		Locking_TX_Pools:                make(map[string][]*Transaction),
 		Coming_TX_Pools:                 make(map[string][]*Transaction),
 		Borrow_Pool:                     make(map[string]*TXborrow),
+		Caravan_Pool:                    make(map[string]*TXcaravan),
 	}
 	// heap.Init(&pool.Heap)
 
@@ -246,7 +250,7 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			if isOuting {
 				// 银行机制：迁移账户的付款由银行代付，只要信用额度足够就聚合为借款
 				admit := false
-				if config.EnableBankMechanism {
+				if config.IsPreempt() {
 					admit = canBorrow(from, v.Value, reserved)
 					if admit {
 						// 预留额度（避免同一区块内超借）
@@ -285,6 +289,20 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			}
 		}
 
+		// Caravan：迁移完成后注入目的分片的 payer 交易（FromMigration 标记），
+		// 按发送方聚合成一笔 TXcaravan，不占用普通交易槽位。
+		if config.IsCaravan() && v.FromMigration {
+			cu := pool.Caravan_Pool[from]
+			if cu == nil {
+				cu = &TXcaravan{Address: from, TotalValue: big.NewInt(0), NumTxs: 0, Outputs: make([]*CreditEntry, 0)}
+				pool.Caravan_Pool[from] = cu
+			}
+			cu.TotalValue.Add(cu.TotalValue, v.Value)
+			cu.NumTxs++
+			cu.Outputs = append(cu.Outputs, &CreditEntry{Recipient: v.Recipient, Value: new(big.Int).Set(v.Value)})
+			continue // 不占用普通交易槽位
+		}
+
 		if tx_cnt > 0 {
 			txs = append(txs, v)
 			tx_cnt--
@@ -309,6 +327,18 @@ func (pool *Tx_pool) FetchBorrows2Pack() []*TXborrow {
 	pool.Borrow_Pool = make(map[string]*TXborrow)
 	pool.Lock.Unlock()
 	return borrows
+}
+
+// FetchCaravans2Pack 取走当前按账户聚合好的 Caravan 条目，并清空 Caravan_Pool。
+func (pool *Tx_pool) FetchCaravans2Pack() []*TXcaravan {
+	pool.Lock.Lock()
+	caravans := make([]*TXcaravan, 0, len(pool.Caravan_Pool))
+	for _, c := range pool.Caravan_Pool {
+		caravans = append(caravans, c)
+	}
+	pool.Caravan_Pool = make(map[string]*TXcaravan)
+	pool.Lock.Unlock()
+	return caravans
 }
 
 // canBorrow 判断迁移账户 addr 在已借款 loan、本区块预留 reserved 的基础上，
@@ -433,6 +463,7 @@ func TxPoolDeepCopy(dst *[]*Transaction, src []*Transaction) {
 			Sen_Suppose_on_chain: tx.Sen_Suppose_on_chain,
 			Rec_Suppose_on_chain: tx.Rec_Suppose_on_chain,
 			Relay_Lock:           tx.Relay_Lock,
+			FromMigration:        tx.FromMigration,
 		})
 	}
 }

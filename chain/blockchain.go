@@ -148,7 +148,7 @@ func (bc *BlockChain) AddBlock(block *core.Block) map[string]*big.Int {
 	}
 
 	updatetree := time.Now().UnixMilli()
-	stateroothash, outbalance := bc.getUpdatedTreeOfState(1, block.Header.Number, block.Transactions, block.TXmig1s, block.TXmig2s, block.Anns, block.NSs, block.TXborrows, block.TXsettles)
+	stateroothash, outbalance := bc.getUpdatedTreeOfState(1, block.Header.Number, block.Transactions, block.TXmig1s, block.TXmig2s, block.Anns, block.NSs, block.TXborrows, block.TXsettles, block.TXcaravans)
 	if !bytes.Equal(block.Header.StateRoot, stateroothash) {
 		log.Panicf("二者不等，Ins长度为%v\n", len(block.TXmig2s))
 	}
@@ -275,7 +275,7 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 		}
 
 		// 银行机制：由本区块内的还款（TXns.Debt）生成 settle-out，并打包收到的 settle-in
-		if params.Config.EnableBankMechanism {
+		if params.Config.IsPreempt() {
 			settleOut := make(map[int]*big.Int)
 			for _, ns := range nss {
 				if ns.Debt == nil || ns.Debt.Sign() == 0 {
@@ -324,8 +324,14 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 
 	// 银行机制：取走聚合好的借款条目（payer 聚合模式）
 	borrows := []*core.TXborrow{}
-	if params.Config.EnableBankMechanism {
+	if params.Config.IsPreempt() {
 		borrows = bc.Tx_pool.FetchBorrows2Pack()
+	}
+
+	// Caravan：取走打包前按迁移账户聚合好的“单账户→多输出”条目
+	caravans := []*core.TXcaravan{}
+	if params.Config.IsCaravan() {
+		caravans = bc.Tx_pool.FetchCaravans2Pack()
 	}
 
 	blockHeader := &core.BlockHeader{
@@ -334,16 +340,16 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 		Time:       uint64(time.Now().Unix()),
 	}
 
-	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles)
+	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles, caravans)
 
 	//普通交易树
 	block.Header.TxHash = GetTxTreeRoot(txs)
 
 	//迁移交易树
-	block.Header.MigHash = GetMigTreeRoot(mig1s, mig2s, anns, nss, borrows, settles)
+	block.Header.MigHash = GetMigTreeRoot(mig1s, mig2s, anns, nss, borrows, settles, caravans)
 
 	//0 代表不更新到磁盘
-	block.Header.StateRoot, _ = bc.getUpdatedTreeOfState(0, blockHeader.Number, txs, mig1s, mig2s, anns, nss, borrows, settles)
+	block.Header.StateRoot, _ = bc.getUpdatedTreeOfState(0, blockHeader.Number, txs, mig1s, mig2s, anns, nss, borrows, settles, caravans)
 
 	block.Hash = block.GetHash()
 
@@ -371,7 +377,7 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 }
 
 // 输出更新后的状态树 以及 要迁出的账户的余额
-func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.Transaction, mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle) ([]byte, map[string]*big.Int) {
+func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.Transaction, mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle, caravans []*core.TXcaravan) ([]byte, map[string]*big.Int) {
 	// build trie from the triedb (in disk)
 	start_execute := time.Now().UnixMicro()
 	st, err := trie.New(trie.TrieID(common.BytesToHash(bc.CurrentBlock.Header.StateRoot)), bc.Triedb)
@@ -380,7 +386,7 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 	}
 
 	// 银行机制仅在“不停且不锁（fine-tuned lock）”路径下启用
-	bankEnabled := bc.ChainConfig.EnableBankMechanism && !bc.ChainConfig.Stop_When_Migrating && !bc.ChainConfig.Lock_Acc_When_Migrating
+	bankEnabled := bc.ChainConfig.IsPreempt() && !bc.ChainConfig.Stop_When_Migrating && !bc.ChainConfig.Lock_Acc_When_Migrating
 	selfShardID := params.ShardTable[bc.ChainConfig.ShardID]
 
 	mig2start := time.Now().UnixMicro()
@@ -616,6 +622,38 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 			}
 		}
 
+		// Caravan：执行“单账户→多输出”聚合交易：对发送方做一次合并扣减，
+		// 对每个本地收款人各入账一次（远程收款人在 commit1 里 relay）。
+		for _, v := range caravans {
+			if v == nil || v.TotalValue == nil || v.TotalValue.Sign() == 0 {
+				continue
+			}
+			hex_address, _ := hex.DecodeString(v.Address)
+			s_state_enc := st.Get(hex_address)
+			if s_state_enc == nil {
+				continue
+			}
+			s_state := account.DecodeAccountState(s_state_enc)
+			s_state.Balance.Sub(s_state.Balance, v.TotalValue)
+			st.Update(hex_address, s_state.Encode())
+
+			for _, o := range v.Outputs {
+				if o == nil || o.Value == nil {
+					continue
+				}
+				r_state_enc := st.Get(o.Recipient)
+				if r_state_enc == nil {
+					continue
+				}
+				r_state := account.DecodeAccountState(r_state_enc)
+				if r_state.Location != selfShardID {
+					continue
+				}
+				r_state.Balance.Add(r_state.Balance, o.Value)
+				st.Update(o.Recipient, r_state.Encode())
+			}
+		}
+
 		// 银行机制：应用跨分片银行结算（本分片是 From 则扣款，是 To 则收款）
 		for _, v := range settles {
 			if v == nil || v.Amount == nil || (v.FromShardID != selfShardID && v.ToShardID != selfShardID) {
@@ -685,7 +723,8 @@ func (bc *BlockChain) NewGenesisBlock() *core.Block {
 	nss := make([]*core.TXns, 0)
 	borrows := make([]*core.TXborrow, 0)
 	settles := make([]*core.TXsettle, 0)
-	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles)
+	caravans := make([]*core.TXcaravan, 0)
+	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles, caravans)
 
 	// build a new trie database by db
 	triedb := trie.NewDatabaseWithConfig(bc.db, &trie.Config{
@@ -763,7 +802,7 @@ func (bc *BlockChain) genesisStateTree(stateroot []byte) []byte {
 	}
 
 	// 银行机制：为本分片初始化一个银行账户（仅当开启银行机制时）
-	if bc.ChainConfig.EnableBankMechanism {
+	if bc.ChainConfig.IsPreempt() {
 		selfShardID := params.ShardTable[bc.ChainConfig.ShardID]
 		bankAddr := account.BankAddrBytes(selfShardID)
 		bankState := &account.AccountState{
@@ -798,7 +837,7 @@ func GetTxTreeRoot(txs []*core.Transaction) []byte {
 }
 
 // Get the transaction root, this root can be used to check the transactions
-func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle) []byte {
+func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle, caravans []*core.TXcaravan) []byte {
 	// use a memory trie database to do this, instead of disk database
 	triedb := trie.NewDatabase(rawdb.NewMemoryDatabase())
 	transactionTree := trie.NewEmpty(triedb)
@@ -818,6 +857,9 @@ func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXa
 		transactionTree.Update(tx.Hash(), tx.Encode())
 	}
 	for _, tx := range settles {
+		transactionTree.Update(tx.Hash(), tx.Encode())
+	}
+	for _, tx := range caravans {
 		transactionTree.Update(tx.Hash(), tx.Encode())
 	}
 	return transactionTree.Hash().Bytes()

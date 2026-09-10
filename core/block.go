@@ -74,12 +74,13 @@ type Block struct {
 	NSs          []*TXns
 	TXborrows    []*TXborrow
 	TXsettles    []*TXsettle
+	TXcaravans   []*TXcaravan
 	Hash         []byte
 	Fee          float64
 }
 
 // core/types/block.go
-func NewBlock(blockHeader *BlockHeader, txs []*Transaction, txmig1s []*TXmig1, txmig2s []*TXmig2, anns []*TXann, nss []*TXns, borrows []*TXborrow, settles []*TXsettle) *Block {
+func NewBlock(blockHeader *BlockHeader, txs []*Transaction, txmig1s []*TXmig1, txmig2s []*TXmig2, anns []*TXann, nss []*TXns, borrows []*TXborrow, settles []*TXsettle, caravans []*TXcaravan) *Block {
 	b := &Block{
 		Header:       blockHeader,
 		Transactions: txs,
@@ -89,6 +90,7 @@ func NewBlock(blockHeader *BlockHeader, txs []*Transaction, txmig1s []*TXmig1, t
 		NSs:          nss,
 		TXborrows:    borrows,
 		TXsettles:    settles,
+		TXcaravans:   caravans,
 	}
 
 	return b
@@ -109,6 +111,7 @@ func (b *Block) PrintBlock() {
 		fmt.Printf("# of NSs: %v\n", len(b.NSs))
 		fmt.Printf("# of Borrows: %v\n", len(b.TXborrows))
 		fmt.Printf("# of Settles: %v\n", len(b.TXsettles))
+		fmt.Printf("# of Caravans: %v\n", len(b.TXcaravans))
 	}
 	fmt.Printf("blockHash: \n")
 	fmt.Printf("%v\n", hex.EncodeToString(b.Hash))

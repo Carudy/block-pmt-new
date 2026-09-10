@@ -331,6 +331,14 @@ func (p *Pbft) handleBalancesAndPendings(content []byte) {
 	inacc_count_lock.Lock()
 	//将pending放入intx池，将acc放入intacc池
 	for addr, bap := range baps.List {
+		// Caravan：标记迁移完成后注入的 payer 交易，供目的分片打包时聚合。
+		if params.Config.IsCaravan() {
+			for _, v := range bap.PendingTxs {
+				if hex.EncodeToString(v.Sender) == addr {
+					v.FromMigration = true
+				}
+			}
+		}
 		inacc_pool = append(inacc_pool, &address_and_balance{Address: addr, Balance: bap.Balance})
 		intx_pool = append(intx_pool, bap.PendingTxs...)
 

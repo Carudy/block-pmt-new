@@ -135,7 +135,7 @@ func NewLog(shardID string) {
 	}
 	// defer csvFile.Close()
 	blocklog = csv.NewWriter(csvFile)
-	blocklog.Write([]string{"timestamp", "blockHeight", "tx_total", "tx_normal", "tx_relay_sender", "tx_relay_receiver", "tx_committed", "pbfttime", "mig1", "mig2", "ann", "ns", "borrow", "borrow_tx", "real_tx_committed", "locked_txs"})
+	blocklog.Write([]string{"timestamp", "blockHeight", "tx_total", "tx_normal", "tx_relay_sender", "tx_relay_receiver", "tx_committed", "pbfttime", "mig1", "mig2", "ann", "ns", "borrow", "borrow_tx", "caravan", "caravan_tx", "real_tx_committed", "locked_txs"})
 	blocklog.Flush()
 
 	csvFile, err = os.Create("./log/" + shardID + "_blockexetime.csv")
@@ -181,7 +181,7 @@ func NewLog(shardID string) {
 	txmig2log.Write([]string{"account", "time"})
 	txmig2log.Flush()
 
-	if params.Config.EnableBankMechanism {
+	if params.Config.IsPreempt() {
 		csvFile, err = os.Create("./log/" + shardID + "_bank.csv")
 		if err != nil {
 			log.Panic(err)
@@ -469,7 +469,7 @@ func (p *Pbft) handleCommit(content []byte) {
 						account.BalanceBeforeOutLock.Unlock()
 
 						// 银行机制：为刚进入迁移的账户初始化信用额度与贷款
-						if params.Config.EnableBankMechanism {
+						if params.Config.IsPreempt() {
 							account.CreditLock.Lock()
 							account.LoanLock.Lock()
 							for k, v := range outbalance {
@@ -488,6 +488,14 @@ func (p *Pbft) handleCommit(content []byte) {
 					for _, b := range block.TXborrows {
 						if b != nil {
 							borrow_tx += b.NumTxs
+						}
+					}
+					// Caravan：聚合条目数与原始 payer 笔数（用于 real_tx 统计）
+					caravan_num := len(block.TXcaravans)
+					caravan_tx := 0
+					for _, c := range block.TXcaravans {
+						if c != nil {
+							caravan_tx += c.NumTxs
 						}
 					}
 					relayCount := 0
@@ -668,6 +676,11 @@ func (p *Pbft) handleCommit(content []byte) {
 						go p.TryRelayBorrows(block.TXborrows)
 					}
 
+					// Caravan：把聚合条目里的远程收款人 relay 出去
+					if params.Config.IsCaravan() && len(block.TXcaravans) != 0 {
+						go p.TryRelayCaravans(block.TXcaravans)
+					}
+
 					if !params.Config.Stop_When_Migrating && !params.Config.Fail {
 						// 发送迁出账户给对应分片
 						if params.Config.Cross_Chain {
@@ -705,14 +718,14 @@ func (p *Pbft) handleCommit(content []byte) {
 					txmig1log.Flush()
 					txmig2log.Flush()
 					// ctxlog.Flush()
-					real_tx_committed := len(commit_txs) + borrow_tx
-					s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, real_tx_committed, locked_cnt)
+					real_tx_committed := len(commit_txs) + borrow_tx + caravan_tx
+					s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, caravan_num, caravan_tx, real_tx_committed, locked_cnt)
 					blocklog.Write(strings.Split(s, " "))
 					blocklog.Flush()
 
 					commitTX_numofNS := Txs_and_Num_of_New_State{
 						Txs:              commit_txs,
-						BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.Transactions),
+						BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.TXcaravans) + len(block.Transactions),
 						Num_of_New_State: len(block.NSs),
 					}
 					//主节点向客户端发送已确认上链的交易集
@@ -1122,6 +1135,59 @@ func (p *Pbft) TryRelayBorrows(borrows []*core.TXborrow) {
 				Sender:    senderBytes,
 				Recipient: c.Recipient,
 				Value:     new(big.Int).Set(c.Value),
+				IsRelay:   true,
+			}
+			relayTx.TxHash = relayTx.Hash()
+			relaypool[toShard] = append(relaypool[toShard], &core.TXrelay{Txcs: relayTx})
+		}
+	}
+
+	for k, v := range params.NodeTable {
+		if k == config.ShardID {
+			continue
+		}
+		txs := relaypool[params.ShardTable[k]]
+		if len(txs) != 0 {
+			target_leader := v["N0"]
+			r := Relay{
+				Txs:     txs,
+				ShardID: config.ShardID,
+			}
+			bc, err := json.Marshal(r)
+			if err != nil {
+				log.Panic(err)
+			}
+			message := jointMessage(cRelay, bc)
+			go utils.TcpDial(message, target_leader)
+		}
+	}
+}
+
+// TryRelayCaravans 把 Caravan 聚合交易里的跨分片收款人 relay 到对应分片（本地收款人已在状态树里入账）。
+func (p *Pbft) TryRelayCaravans(caravans []*core.TXcaravan) {
+	if len(caravans) == 0 {
+		return
+	}
+	config := params.Config
+	selfShardID := params.ShardTable[config.ShardID]
+	relaypool := make([][]*core.TXrelay, config.Shard_num)
+	for _, c := range caravans {
+		if c == nil {
+			continue
+		}
+		senderBytes, _ := hex.DecodeString(c.Address)
+		for _, o := range c.Outputs {
+			if o == nil || o.Value == nil {
+				continue
+			}
+			toShard := account.Addr2Shard(hex.EncodeToString(o.Recipient))
+			if toShard == selfShardID {
+				continue // 本地收款人
+			}
+			relayTx := &core.Transaction{
+				Sender:    senderBytes,
+				Recipient: o.Recipient,
+				Value:     new(big.Int).Set(o.Value),
 				IsRelay:   true,
 			}
 			relayTx.TxHash = relayTx.Hash()
@@ -1658,7 +1724,7 @@ func (p *Pbft) handleChangesAndPendings(content []byte) {
 	// fmt.Printf("本节点已接收到分片%v发来的余额变化和交易 \n", caps.ShardID)
 
 	//将pending放入交易池，将changes放入change池
-	for _, cap := range caps.List {
+	for addr, cap := range caps.List {
 
 		for _, v := range cap.PendingTxs {
 			// to := hex.EncodeToString(v.Recipient)
@@ -1680,6 +1746,11 @@ func (p *Pbft) handleChangesAndPendings(content []byte) {
 			// } else {
 			// 	v.UnlockTime = time.Now().UnixMilli()
 			// }
+			// Caravan：标记“迁移完成后注入目的分片”的 payer 交易（sender 为该迁入账户），
+			// 目的分片打包时会按账户聚合成 TXcaravan。
+			if params.Config.IsCaravan() && hex.EncodeToString(v.Sender) == addr {
+				v.FromMigration = true
+			}
 			v.Success = true
 			p.Node.CurChain.Tx_pool.Lock.Lock()
 			p.Node.CurChain.Tx_pool.AddTx(v)

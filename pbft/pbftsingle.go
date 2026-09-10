@@ -51,7 +51,7 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 				account.BalanceBeforeOutLock.Unlock()
 
 				// 银行机制：为刚进入迁移的账户初始化信用额度与贷款
-				if params.Config.EnableBankMechanism {
+				if params.Config.IsPreempt() {
 					account.CreditLock.Lock()
 					account.LoanLock.Lock()
 					for k, v := range outbalance {
@@ -70,6 +70,14 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			for _, b := range block.TXborrows {
 				if b != nil {
 					borrow_tx += b.NumTxs
+				}
+			}
+			// Caravan：聚合条目数与原始 payer 笔数（用于 real_tx 统计）
+			caravan_num := len(block.TXcaravans)
+			caravan_tx := 0
+			for _, c := range block.TXcaravans {
+				if c != nil {
+					caravan_tx += c.NumTxs
 				}
 			}
 			relayCount := 0
@@ -198,7 +206,7 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 
 					// 银行机制：迁移失败，清理该账户的贷款/信用记录，避免债务被带到目标分片。
 					// 注意：完整的 trie 层面轧差（扣账户余额还给银行）留待后续阶段实现。
-					if params.Config.EnableBankMechanism {
+					if params.Config.IsPreempt() {
 						account.LoanLock.Lock()
 						delete(account.Loan, "489338d5e8d42e8c923d1f47361d979503d4ad68")
 						account.LoanLock.Unlock()
@@ -262,6 +270,11 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 				go p.TryRelayBorrows(block.TXborrows)
 			}
 
+			// Caravan：把聚合条目里的远程收款人 relay 出去
+			if params.Config.IsCaravan() && len(block.TXcaravans) != 0 {
+				go p.TryRelayCaravans(block.TXcaravans)
+			}
+
 			if !params.Config.Stop_When_Migrating && !params.Config.Fail {
 				// 发送迁出账户给对应分片
 				if params.Config.Cross_Chain {
@@ -276,7 +289,7 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			}
 
 			// 银行机制：本分片是结算发送方时，通知接收方分片
-			if params.Config.EnableBankMechanism {
+			if params.Config.IsPreempt() {
 				selfShardID := params.ShardTable[params.Config.ShardID]
 				for _, settle := range block.TXsettles {
 					if settle.FromShardID == selfShardID {
@@ -314,11 +327,11 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			txmig1log.Flush()
 			txmig2log.Flush()
 
-			// 真实处理交易数：普通 commit 交易 + 聚合 payer 借款的原始笔数（仅用于吞吐统计，不影响运行逻辑）
-			real_tx_committed := len(commit_txs) + borrow_tx
+			// 真实处理交易数：普通 commit 交易 + 聚合的原始 payer 笔数（借款 / Caravan）（仅用于吞吐统计，不影响运行逻辑）
+			real_tx_committed := len(commit_txs) + borrow_tx + caravan_tx
 
 			// 银行机制：记录银行余额、活跃贷款数与跨分片结算
-			if params.Config.EnableBankMechanism {
+			if params.Config.IsPreempt() {
 				selfShardID := params.ShardTable[params.Config.ShardID]
 				bankBalance := big.NewInt(0)
 				// 使用独立 trie 读取银行余额，避免与 handleAnns 中异步 mpAndSend 对 st1 的并发读冲突
@@ -352,13 +365,13 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			}
 
 			// ctxlog.Flush()
-			s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, real_tx_committed, locked_cnt)
+			s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, caravan_num, caravan_tx, real_tx_committed, locked_cnt)
 			blocklog.Write(strings.Split(s, " "))
 			blocklog.Flush()
 
 			commitTX_numofNS := Txs_and_Num_of_New_State{
 				Txs:              commit_txs,
-				BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.Transactions),
+				BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.TXcaravans) + len(block.Transactions),
 				Num_of_New_State: len(block.NSs),
 			}
 			//主节点向客户端发送已确认上链的交易集

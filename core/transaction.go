@@ -13,26 +13,29 @@ import (
 )
 
 type Transaction struct {
-	Sender             []byte `json:"sender"`
-	Recipient          []byte `json:"recipient"`
-	TxHash             []byte
-	Id                 int
-	Success            bool
-	IsRelay            bool
-	SenLock            bool
-	RecLock            bool
-	Value              *big.Int `json:"value"`
-	RequestTime        int64
-	Second_RequestTime int64
-	CommitTime         int64
-	LockTime           int64
-	UnlockTime         int64
-	LockTime2          int64
-	UnlockTime2        int64
-	HalfLock           bool
-	Rec_Suppose_on_chain   int
-	Sen_Suppose_on_chain   int
-	Relay_Lock         bool
+	Sender               []byte `json:"sender"`
+	Recipient            []byte `json:"recipient"`
+	TxHash               []byte
+	Id                   int
+	Success              bool
+	IsRelay              bool
+	SenLock              bool
+	RecLock              bool
+	Value                *big.Int `json:"value"`
+	RequestTime          int64
+	Second_RequestTime   int64
+	CommitTime           int64
+	LockTime             int64
+	UnlockTime           int64
+	LockTime2            int64
+	UnlockTime2          int64
+	HalfLock             bool
+	Rec_Suppose_on_chain int
+	Sen_Suppose_on_chain int
+	Relay_Lock           bool
+	// Caravan：标记该交易为“迁移完成后被注入目的分片并 unlock”的 payer 交易，
+	// 目的分片打包时可将其按发送方聚合成 TXcaravan。仅作内存标记，不参与 tx 哈希。
+	FromMigration bool
 }
 
 func (tx *Transaction) PrintTx() {

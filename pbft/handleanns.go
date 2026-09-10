@@ -340,7 +340,7 @@ func (p *Pbft) mpAndSend(isdelete map[string]string, anns []*core.TXann, cAps ma
 
 		// 银行机制：取出该账户在迁移窗口内累计的贷款，并清理信用/贷款记录
 		loan := big.NewInt(0)
-		if params.Config.EnableBankMechanism && !params.Config.Lock_Acc_When_Migrating {
+		if params.Config.IsPreempt() && !params.Config.Lock_Acc_When_Migrating {
 			account.LoanLock.Lock()
 			if l := account.Loan[ann.Address]; l != nil {
 				loan.Set(l)

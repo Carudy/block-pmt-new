@@ -6,6 +6,24 @@ import (
 	"strconv"
 )
 
+// Schema 标识迁移期间的 payer 交易处理方案（三种方案的迁移流程均为“不停不锁”half-lock 基线）。
+type Schema string
+
+const (
+	SchemaFTL     Schema = "ftl"     // Fine-tuned Lock：迁移中锁 payer、放行 payee；迁移完成注入目的分片后正常打包
+	SchemaCaravan Schema = "caravan" // FTL + 目的分片打包前把同账户多笔 payer 交易聚合成“单账户→多输出”交易
+	SchemaPreempt Schema = "preempt" // 银行代付：迁移中源分片聚合 payer 为借款，银行直接付给 payee
+)
+
+// IsFTL 判断当前是否 FTL 方案（caravan 的迁移/锁定/注入流程与 ftl 相同，但打包阶段多一步聚合）。
+func (c *ChainConfig) IsFTL() bool { return c.Schema == SchemaFTL }
+
+// IsCaravan 判断当前是否 Caravan 方案。
+func (c *ChainConfig) IsCaravan() bool { return c.Schema == SchemaCaravan }
+
+// IsPreempt 判断当前是否 Preempt（银行代付）方案。
+func (c *ChainConfig) IsPreempt() bool { return c.Schema == SchemaPreempt }
+
 type ChainConfig struct {
 	ChainID                  int
 	NodeID                   string
@@ -44,12 +62,10 @@ type ChainConfig struct {
 	Not_Lock_immediately     bool
 	RelayLock                bool
 
-	// Bank mechanism configuration
-	EnableBankMechanism bool     // Enable/disable bank mechanism
-	BankInitialBalance  *big.Int // Initial balance for bank account
-	BankInterestRate    *big.Int // Interest rate (1e18 = 100%)
-	MaxLoanPerAccount   *big.Int // Maximum loan amount per account
-	LoanRepaymentPeriod uint64   // Blocks until repayment is due
+	// 协议方案：ftl / caravan / preempt。取代原来的 EnableBankMechanism 开关。
+	Schema Schema
+	// 仅 preempt 使用：本分片银行账户的初始余额（视为“无限”）。
+	BankInitialBalance *big.Int
 }
 
 var (
@@ -108,7 +124,7 @@ var (
 		MaxRelayBlockSize: 10,
 		MinRelayBlockSize: 1,
 		Inject_speed:      500,
-		// Inject_speed:     1000,
+		// Inject_speed:     2000,
 		Relay_interval:   1000,
 		Max_Commit:       100000,
 		Max_Commit_Block: 50,
@@ -131,12 +147,10 @@ var (
 		Not_Lock_immediately:     true,
 		RelayLock:                true,
 
-		// Bank mechanism defaults (enabled by default)
-		EnableBankMechanism: true,
-		BankInitialBalance:  new(big.Int).Exp(big.NewInt(10), big.NewInt(60), nil), // 10^60, 视为“无限”
-		BankInterestRate:    big.NewInt(1000000000000000000),                       // 0% interest (1e18 = 100%)
-		MaxLoanPerAccount:   new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), // 10^30, 视为“无限”
-		LoanRepaymentPeriod: 100,                                                   // 100 blocks to repay
+		// Schema:             SchemaFTL,
+		Schema: SchemaCaravan,
+		// Schema:             SchemaPreempt,
+		BankInitialBalance: new(big.Int).Exp(big.NewInt(10), big.NewInt(60), nil), // 10^60, 视为“无限”
 	}
 
 	Init_addrs          = []string{}
