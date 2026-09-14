@@ -1,5 +1,5 @@
 # --- Binaries & build artifacts ---
-block_ori_exe
+block_exe
 blockexe
 *.exe
 *.o
@@ -7,6 +7,7 @@ a.out
 
 # --- Databases ---
 *_blockchain_db
+/intermediate/
 /record/triedb/
 
 # --- Logs ---
@@ -26,6 +27,9 @@ a.out
 
 # --- Generated archives ---
 *.zip
+
+# --- Experiment results ---
+/res/
 
 # --- OS / editor ---
 .DS_Store

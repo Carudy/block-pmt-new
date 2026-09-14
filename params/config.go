@@ -6,14 +6,20 @@ import (
 	"strconv"
 )
 
-// Schema 标识迁移期间的 payer 交易处理方案（三种方案的迁移流程均为“不停不锁”half-lock 基线）。
+// Schema 标识迁移期间的方案。4 种方案的迁移流程均为“不停”模式，
+// 其中 lb 为全锁（Lock_Acc_When_Migrating=true），其余三种为半锁（false）。
+// Normalize() 会据 Schema 派生 Lock_Acc_When_Migrating，Schema 是唯一控制点。
 type Schema string
 
 const (
+	SchemaLB      Schema = "lb"      // LB-chain：迁移时全锁账户（payer+payee 都锁），其余同 FTL
 	SchemaFTL     Schema = "ftl"     // Fine-tuned Lock：迁移中锁 payer、放行 payee；迁移完成注入目的分片后正常打包
 	SchemaCaravan Schema = "caravan" // FTL + 目的分片打包前把同账户多笔 payer 交易聚合成“单账户→多输出”交易
 	SchemaPreempt Schema = "preempt" // 银行代付：迁移中源分片聚合 payer 为借款，银行直接付给 payee
 )
+
+// IsLB 判断当前是否 LB-chain（全锁）方案。
+func (c *ChainConfig) IsLB() bool { return c.Schema == SchemaLB }
 
 // IsFTL 判断当前是否 FTL 方案（caravan 的迁移/锁定/注入流程与 ftl 相同，但打包阶段多一步聚合）。
 func (c *ChainConfig) IsFTL() bool { return c.Schema == SchemaFTL }
@@ -23,6 +29,19 @@ func (c *ChainConfig) IsCaravan() bool { return c.Schema == SchemaCaravan }
 
 // IsPreempt 判断当前是否 Preempt（银行代付）方案。
 func (c *ChainConfig) IsPreempt() bool { return c.Schema == SchemaPreempt }
+
+// Normalize 以 Schema 为唯一控制点派生迁移开关：
+//
+//	lb                      -> Lock_Acc_When_Migrating = true
+//	ftl / caravan / preempt -> Lock_Acc_When_Migrating = false
+func (c *ChainConfig) Normalize() {
+	switch c.Schema {
+	case SchemaLB:
+		c.Lock_Acc_When_Migrating = true
+	case SchemaFTL, SchemaCaravan, SchemaPreempt:
+		c.Lock_Acc_When_Migrating = false
+	}
+}
 
 type ChainConfig struct {
 	ChainID                  int
@@ -62,7 +81,7 @@ type ChainConfig struct {
 	Not_Lock_immediately     bool
 	RelayLock                bool
 
-	// 协议方案：ftl / caravan / preempt。取代原来的 EnableBankMechanism 开关。
+	// 协议方案：lb / ftl / caravan / preempt。取代原来的 EnableBankMechanism 开关。
 	Schema Schema
 	// 仅 preempt 使用：本分片银行账户的初始余额（视为“无限”）。
 	BankInitialBalance *big.Int
@@ -147,8 +166,9 @@ var (
 		Not_Lock_immediately:     true,
 		RelayLock:                true,
 
+		Schema: SchemaLB,
 		// Schema:             SchemaFTL,
-		Schema: SchemaCaravan,
+		// Schema:             SchemaCaravan,
 		// Schema:             SchemaPreempt,
 		BankInitialBalance: new(big.Int).Exp(big.NewInt(10), big.NewInt(60), nil), // 10^60, 视为“无限”
 	}
@@ -191,4 +211,9 @@ func RenewShardTable(num_shards, num_nodes_per_shard int) {
 		}
 		return shardTableInt2Str
 	}()
+}
+
+// init 在包加载完成后立即据 Schema 归一化迁移开关（Schema 是唯一控制点）。
+func init() {
+	Config.Normalize()
 }

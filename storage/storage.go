@@ -4,6 +4,7 @@ import (
 	"blockEmulator/core"
 	"errors"
 	"log"
+	"os"
 
 	"blockEmulator/params"
 
@@ -11,7 +12,9 @@ import (
 )
 
 const (
-	dbFile                = "blockchain_db"
+	dbFile = "blockchain_db"
+	// IntermediateDir 存放各节点的 bolt 数据库文件，避免污染项目根目录。
+	IntermediateDir       = "./intermediate"
 	blocksBucket          = "blocks"
 	blockHeaderBucket     = "blockHeaders"
 	newestBlockHashBucket = "newBlockHash"
@@ -27,8 +30,11 @@ type Storage struct {
 }
 
 func NewStorage(chainConfig *params.ChainConfig) *Storage {
+	if err := os.MkdirAll(IntermediateDir, 0755); err != nil {
+		log.Panic(err)
+	}
 	s := &Storage{
-		dbFile:                chainConfig.ShardID + "_" + chainConfig.NodeID + "_" + dbFile,
+		dbFile:                IntermediateDir + "/" + chainConfig.ShardID + "_" + chainConfig.NodeID + "_" + dbFile,
 		blocksBucket:          blocksBucket,
 		blockHeaderBucket:     blockHeaderBucket,
 		newestBlockHashBucket: newestBlockHashBucket,

@@ -2,11 +2,26 @@
 
 # Basic Blockchain Shard Network Runner
 # Sets num_shards and num_nodes variables and starts all nodes
-./kill_block_ori_exe.sh  # Kill any existing block_ori_exe processes
+./kill_block_exe.sh  # Kill any existing block_exe processes
 ./clean.sh
 
-# rebuild
-go build -o block_ori_exe .
+# ==== 期望运行的方案（会据此自动改写 params/config.go 的 Schema 行）：
+# lb | ftl | caravan | preempt ====
+SCHEMA=lb
+
+# rebuild（先按 SCHEMA 改写 config.go，再编译）
+./set_schema.sh "$SCHEMA" || { echo "set_schema.sh 失败，终止。"; exit 1; }
+go build -o block_exe .
+
+# --- 从 params/config.go 检测当前 scheme 与注入速率 ---
+source ./schema_detect.sh
+if schema_detect; then
+    echo "Detected scheme : ${SCHEMA}"
+    echo "Inject_speed    : ${INJECT_SPEED}"
+else
+    echo "WARN: 无法从 params/config.go 识别 scheme（请确认 Schema 行未被注释）"
+fi
+echo ""
 
 # Configuration variables - edit these as needed
 num_shards=2      # Number of shards (S0, S1, S2, S3)
@@ -21,10 +36,10 @@ echo "Malicious nodes per shard: $malicious_num"
 echo "Test file: $test_file"
 echo ""
 
-# Check if block_ori_exe exists
-if [ ! -f "./block_ori_exe" ]; then
-    echo "ERROR: block_ori_exe executable not found!"
-    echo "Please build the project first: go build -o block_ori_exe"
+# Check if block_exe exists
+if [ ! -f "./block_exe" ]; then
+    echo "ERROR: block_exe executable not found!"
+    echo "Please build the project first: go build -o block_exe"
     exit 1
 fi
 
@@ -34,10 +49,10 @@ if [ ! -f "$test_file" ]; then
     exit 1
 fi
 
-# Make block_ori_exe executable if needed
-if [ ! -x "./block_ori_exe" ]; then
-    chmod +x ./block_ori_exe
-    echo "Made block_ori_exe executable"
+# Make block_exe executable if needed
+if [ ! -x "./block_exe" ]; then
+    chmod +x ./block_exe
+    echo "Made block_exe executable"
 fi
 
 # Create log directory
@@ -59,7 +74,7 @@ for ((s=0; s<num_shards; s++)); do
         echo "Starting $shard_id $node_id..."
 
         # Start node with exact command format from requirements
-        ./block_ori_exe -S $num_shards -N $num_nodes -s $shard_id -n $node_id -t $test_file > "$log_file" 2>&1 &
+        ./block_exe -S $num_shards -N $num_nodes -s $shard_id -n $node_id -t $test_file > "$log_file" 2>&1 &
 
         pid=$!
         node_pids+=($pid)
@@ -80,7 +95,7 @@ echo "Starting client/supervisor..."
 client_log="$log_dir/client.log"
 
 # Start client with -c flag as requested
-./block_ori_exe -c -S $num_shards -N $num_nodes -t $test_file  > "$client_log" 2>&1 &
+./block_exe -c -S $num_shards -N $num_nodes -t $test_file  > "$client_log" 2>&1 &
 
 client_pid=$!
 node_pids+=($client_pid)
@@ -95,3 +110,24 @@ echo "All output is being logged to: $log_dir/"
 echo ""
 echo "To view logs:"
 echo "  tail -f $log_dir/*.log"
+echo ""
+
+# --- 等待实验结束：client 在结束时打印 “停止时间：...” 并退出 ---
+echo "Waiting for the run to finish (client prints '停止时间') ..."
+while ! grep -q "停止时间" "$client_log" 2>/dev/null; do
+    if ! kill -0 "$client_pid" 2>/dev/null; then
+        echo "client 进程已退出（未检测到 '停止时间'，可能异常结束）。"
+        break
+    fi
+    sleep 5
+done
+
+# 给各个节点一点时间把日志刷盘
+sleep 2
+
+echo ""
+echo "Run finished. Stopping nodes ..."
+./kill_block_exe.sh
+
+echo "Packaging results ..."
+N_SHARD="$num_shards" ./zip_res.sh

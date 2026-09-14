@@ -1,19 +1,30 @@
 #!/bin/bash
 
-# 根据 params/config.go 中的 Schema 默认值决定输出包名：
-#   preempt -> res_preempt.zip
-#   caravan -> res_caravan.zip
-#   ftl     -> res_finetune.zip
-if grep -Eq 'Schema:[[:space:]]*SchemaPreempt' params/config.go; then
-    RESULT="res_preempt"
-elif grep -Eq 'Schema:[[:space:]]*SchemaCaravan' params/config.go; then
-    RESULT="res_caravan"
-else
-    RESULT="res_finetune"
+# 打包实验结果到 res/ 目录，命名格式： res_{schema}_n{shards}_s{inject}.zip
+#   例：res_caravan_n2_s500.zip
+#
+# schema / inject_speed 从 params/config.go 的【生效行】读取；
+# 分片数默认从 run.sh 的 num_shards 读取，也可用环境变量覆盖：
+#   N_SHARD=2 ./zip_res.sh
+
+source ./schema_detect.sh
+schema_detect || exit 1
+
+if [ -z "${N_SHARD}" ]; then
+    N_SHARD=$(sed -n 's/^[[:space:]]*num_shards=\([0-9][0-9]*\).*/\1/p' run.sh | head -n 1)
+fi
+if [ -z "${N_SHARD}" ]; then
+    echo "ERROR: 无法确定分片数（run.sh 中未找到 num_shards；可用 N_SHARD=2 ./zip_res.sh 覆盖）" >&2
+    exit 1
 fi
 
-echo "Schema -> ${RESULT}.zip"
+STAMP=$(date +%Y%m%d%H%M)
+NAME="res_${SCHEMA}_n${N_SHARD}_s${INJECT_SPEED}_${STAMP}"
+OUT="res/${NAME}.zip"
 
-rm -f "./${RESULT}.zip"
-zip -r "${RESULT}.zip" log
-cp "${RESULT}.zip" /disc/home/dy/caddy/site
+mkdir -p res
+rm -f "${OUT}"
+zip -r "${OUT}" log
+cp "${OUT}" /disc/home/dy/caddy/site
+
+echo "Wrote ${OUT}  (schema=${SCHEMA}, shards=${N_SHARD}, inject_speed=${INJECT_SPEED})"
