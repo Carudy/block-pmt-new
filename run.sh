@@ -130,11 +130,19 @@ echo "  tail -f $log_dir/*.log"
 echo ""
 
 # --- 等待实验结束：client 在结束时打印 “停止时间：...” 并退出 ---
+# RUN_TIMEOUT_SEC>0 时，超时即终止本次运行（避免严格 nonce 模式卡死后无人干预）。
 echo "Waiting for the run to finish (client prints '停止时间') ..."
+run_timeout="${RUN_TIMEOUT_SEC:-0}"
+run_started=$(date +%s)
 while ! grep -q "停止时间" "$client_log" 2>/dev/null; do
     if ! kill -0 "$client_pid" 2>/dev/null; then
         echo "client 进程已退出（未检测到 '停止时间'，可能异常结束）。"
         break
+    fi
+    if [ "$run_timeout" -gt 0 ] && [ $(( $(date +%s) - run_started )) -ge "$run_timeout" ]; then
+        echo "!! 超过 RUN_TIMEOUT_SEC=${run_timeout}s 仍未结束，终止本次运行。" >&2
+        ./kill_block_exe.sh
+        exit 2
     fi
     sleep 5
 done

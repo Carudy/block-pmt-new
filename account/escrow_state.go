@@ -317,6 +317,19 @@ func IsFlowActive(addr string) bool {
 	return FlowActive[addr]
 }
 
+// HasSettledEscrowRecord 报告 addr 是否在本分片留下了“已结算（或已过期）后离开”的记录。
+// 用于把交接瞬间还滞留在队列里的交易转发到它当前所在的分片。
+func HasSettledEscrowRecord(addr string) bool {
+	EscrowLock.Lock()
+	defer EscrowLock.Unlock()
+	for _, rec := range EscrowRecords {
+		if rec.Account == addr && (rec.Status == params.EscrowSettled || rec.Status == params.EscrowExpired) {
+			return true
+		}
+	}
+	return false
+}
+
 // InLocalEscrowFlow 报告 addr 是否正被本分片的 escrow 状态跟踪：
 // 源分片上的锁定账户，或目的分片上已 prepare 但尚未 Debit 的账户。
 // 用于在交接窗口内保留交易，避免注入路径把它们当成“别人的交易”丢掉。
@@ -424,6 +437,9 @@ func FinalizePending(migID string, aborted bool) {
 		p.Delivered = true
 		if aborted {
 			p.Status = params.EscrowAborted
+			// 撤销 flow 状态，否则 relay 会一直认为该账户还在本分片迁移中。
+			delete(FlowBlocked, p.Account)
+			delete(FlowActive, p.Account)
 		} else {
 			p.Status = params.EscrowDelivered
 		}

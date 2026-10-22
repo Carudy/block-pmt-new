@@ -1353,7 +1353,18 @@ func (p *Pbft) handleRelay(content []byte) {
 	txcss := make([]*core.Transaction, 0)
 	for _, tx := range relay.Txs {
 		txcs := tx.Txcs
-		target_shardID := account.Addr2Shard(hex.EncodeToString(txcs.Recipient))
+		recipientHex := hex.EncodeToString(txcs.Recipient)
+		target_shardID := account.Addr2Shard(recipientHex)
+		// preempt_escrow：收款方可能已经迁移，按当前映射而不是初始映射路由，
+		// 否则汇款会被送到旧分片并当作“收款方不在本分片”丢掉。
+		// 旧 schema 保持原行为（它们的迁移语义不同，不能共用）。
+		if params.Config.IsPreemptEscrow() {
+			account.Account2ShardLock.Lock()
+			if sid, ok := account.Account2Shard[recipientHex]; ok {
+				target_shardID = sid
+			}
+			account.Account2ShardLock.Unlock()
+		}
 		account.Lock_Acc_Lock.Lock()
 		if !params.Config.Not_Lock_immediately && account.Lock_Acc[hex.EncodeToString(txcs.Recipient)] {
 			if txcs.LockTime > 0 {

@@ -28,14 +28,18 @@ var (
 	all_finish chan int
 	// max_commit                            int
 	// max_commit_lock                       sync.Mutex
-	max_commit_block                      int
-	max_commit_block_lock                 sync.Mutex
-	commit_tx_set                         []*core.Transaction
-	commit_tx_set_lock                    sync.Mutex
-	pending_tx_set                        []*core.Transaction
-	pending_tx_set_lock                   sync.Mutex
-	migrationlog                          *csv.Writer
-	injectlog                             *csv.Writer
+	max_commit_block      int
+	max_commit_block_lock sync.Mutex
+	commit_tx_set         []*core.Transaction
+	commit_tx_set_lock    sync.Mutex
+	pending_tx_set        []*core.Transaction
+	pending_tx_set_lock   sync.Mutex
+	migrationlog          *csv.Writer
+	injectlog             *csv.Writer
+	// preempt_escrow 注入确认/重传状态（Seq -> 未确认消息）
+	escrowInjectLock                      sync.Mutex
+	escrowInjectSeq                       uint64
+	escrowInjectPending                   map[uint64]*escrowInjectMsg
 	migration_count                       int
 	migration_count_lock                  sync.Mutex
 	sendtxlock                            sync.Mutex
@@ -74,6 +78,8 @@ func RunClient(path string) {
 	num_of_shard_not_sending_pending = params.Config.Shard_num
 	zero_count = 0
 	escrowClientNonces = make(map[int]uint64)
+	escrowInjectPending = make(map[uint64]*escrowInjectMsg)
+	startEscrowInjectRetry()
 	escrowTermEpoch = make(map[string]int)
 	escrowBusyShards = make(map[string]bool)
 	escrowInjectionDone = false
@@ -250,6 +256,10 @@ func RunClient(path string) {
 		if params.Config.IsPreemptEscrow() {
 			go func() {
 				InjectEscrowTXS(txs)
+				// 等注入确认（或超时）再收尾，避免重传还在路上就停机。
+				if left := waitEscrowInjectAcks(15 * time.Second); left != 0 {
+					fmt.Printf("preempt_escrow: 注入结束时仍有 %d 条消息未确认\n", left)
+				}
 				escrowClientLock.Lock()
 				escrowInjectionDone = true
 				escrowClientLock.Unlock()
@@ -663,6 +673,14 @@ func handle(data []byte) {
 		num_of_unfinished_migration -= UnchangedState
 		num_of_unfinished_migration_lock.Unlock()
 
+	case cEscrowAck:
+		var a EscrowClientAck
+		if err := json.Unmarshal(content, &a); err == nil {
+			escrowInjectLock.Lock()
+			delete(escrowInjectPending, a.Seq)
+			escrowInjectLock.Unlock()
+		}
+
 	case cEscrowActive:
 		a := core.DecodeEscrowActivate(content)
 		if a == nil {
@@ -1000,6 +1018,79 @@ func Get_Initial_Map_And_TXS(path string, Account2Shard map[string]int) []*core.
 	return txs
 }
 
+// escrowInjectMsg 是一条等待确认的注入消息。
+type escrowInjectMsg struct {
+	Shard int
+	Addr  string
+	Txs   []*core.EscrowTx
+	Sent  int64
+}
+
+// sendEscrowInject 发送一条注入消息并记录待确认。
+// 分片处理完会回 EscrowClientAck；未确认的消息由 startEscrowInjectRetry 重发，
+// 分片按 Seq 去重，重发幂等。
+func sendEscrowInject(shardID int, addr string, txs []*core.EscrowTx) {
+	escrowInjectLock.Lock()
+	escrowInjectSeq++
+	seq := escrowInjectSeq
+	if escrowInjectPending == nil {
+		escrowInjectPending = make(map[uint64]*escrowInjectMsg)
+	}
+	escrowInjectPending[seq] = &escrowInjectMsg{Shard: shardID, Addr: addr, Txs: txs, Sent: time.Now().UnixMilli()}
+	escrowInjectLock.Unlock()
+
+	transmitEscrowInject(seq, addr, txs)
+}
+
+func transmitEscrowInject(seq uint64, addr string, txs []*core.EscrowTx) {
+	b, err := json.Marshal(EscrowTxsFromClient{Seq: seq, Txs: txs})
+	if err != nil {
+		log.Panic(err)
+	}
+	utils.TcpDial(jointMessage(cEscrowClient, b), addr)
+}
+
+// startEscrowInjectRetry 定期重发未确认的注入消息。
+func startEscrowInjectRetry() {
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			now := time.Now().UnixMilli()
+			type item struct {
+				seq  uint64
+				addr string
+				txs  []*core.EscrowTx
+			}
+			var resend []item
+			escrowInjectLock.Lock()
+			for seq, p := range escrowInjectPending {
+				if now-p.Sent >= 3000 {
+					p.Sent = now
+					resend = append(resend, item{seq: seq, addr: p.Addr, txs: p.Txs})
+				}
+			}
+			escrowInjectLock.Unlock()
+			for _, it := range resend {
+				go transmitEscrowInject(it.seq, it.addr, it.txs)
+			}
+		}
+	}()
+}
+
+// waitEscrowInjectAcks 等所有注入被确认（或超时），返回仍未确认的条数。
+func waitEscrowInjectAcks(timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		escrowInjectLock.Lock()
+		n := len(escrowInjectPending)
+		escrowInjectLock.Unlock()
+		if n == 0 || time.Now().After(deadline) {
+			return n
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // logInjectRange 记录一次注入消息覆盖的 txid 区间。
 // 用于对账：客户端注入的 id 总数应当等于
 // 提交（transaction.csv）+ 委托（batch ntx）+ 丢弃（S*_intake.csv）+ 残留（queue_dump）。
@@ -1099,13 +1190,9 @@ func InjectEscrowTXS(txs []*core.Transaction) {
 			if len(ktxs) == 0 {
 				continue
 			}
-			b, err := json.Marshal(EscrowTxsFromClient{Txs: ktxs})
-			if err != nil {
-				log.Panic(err)
-			}
 			if addr := v["N0"]; addr != "" {
 				logInjectRange(params.ShardTable[k], len(ktxs), ktxs[0].Tx.Id, ktxs[len(ktxs)-1].Tx.Id)
-				utils.TcpDial(jointMessage(cEscrowClient, b), addr)
+				sendEscrowInject(params.ShardTable[k], addr, ktxs)
 			}
 		}
 

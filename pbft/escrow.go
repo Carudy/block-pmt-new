@@ -27,7 +27,11 @@ var (
 
 	escrowSyntheticID int64
 	escrowTxLogLock   sync.Mutex
-	escrowDelivered   = struct {
+
+	// 注入消息去重：Seq -> 已处理（重传幂等）。
+	escrowInjectSeen     map[uint64]bool
+	escrowInjectSeenLock sync.Mutex
+	escrowDelivered      = struct {
 		sync.Mutex
 		M map[string]bool
 	}{M: make(map[string]bool)}
@@ -59,6 +63,19 @@ func (p *Pbft) handleEscrowTxsFromClient(content []byte) {
 	if err := json.Unmarshal(content, msg); err != nil {
 		logEscrow("bad escrow client message: %v", err)
 		return
+	}
+	if msg.Seq != 0 {
+		escrowInjectSeenLock.Lock()
+		if escrowInjectSeen == nil {
+			escrowInjectSeen = make(map[uint64]bool)
+		}
+		if escrowInjectSeen[msg.Seq] {
+			escrowInjectSeenLock.Unlock()
+			sendEscrowAck(msg.Seq) // 重传：已经处理过，直接再确认一次
+			return
+		}
+		escrowInjectSeen[msg.Seq] = true
+		escrowInjectSeenLock.Unlock()
 	}
 	self := params.ShardTable[params.Config.ShardID]
 	forward := make(map[int][]*core.EscrowTx)
@@ -101,6 +118,20 @@ func (p *Pbft) handleEscrowTxsFromClient(content []byte) {
 	for sid, txs := range forward {
 		p.sendEscrowClientTxs(sid, txs)
 	}
+
+	// 入池之后才确认，保证客户端停止重传时交易确实已经在本分片。
+	if msg.Seq != 0 {
+		sendEscrowAck(msg.Seq)
+	}
+}
+
+// sendEscrowAck 告诉客户端某条注入消息已被本分片处理。
+func sendEscrowAck(seq uint64) {
+	b, err := json.Marshal(EscrowClientAck{ShardID: params.ShardTable[params.Config.ShardID], Seq: seq})
+	if err != nil {
+		return
+	}
+	utils.TcpDial(jointMessage(cEscrowAck, b), params.ClientAddr)
 }
 
 func (p *Pbft) sendEscrowClientTxs(shardID int, txs []*core.EscrowTx) {
@@ -390,6 +421,28 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 		}
 		if escrowdroplog != nil {
 			escrowdroplog.Flush()
+		}
+	}
+
+	// 交接窗口：账户已经结算离开，但交易刚好处在“队列已取、映射已改”的窄缝里。
+	// 把它们转发到账户当前所在的分片，而不是当成丢给别的分片的交易丢掉。
+	if fwd := p.Node.CurChain.Tx_pool.TakeEscrowForward(); len(fwd) != 0 {
+		byShard := make(map[int][]*core.EscrowTx)
+		for _, e := range fwd {
+			if e == nil || e.Tx == nil {
+				continue
+			}
+			addr := hex.EncodeToString(e.Tx.Sender)
+			account.Account2ShardLock.Lock()
+			sid, ok := account.Account2Shard[addr]
+			account.Account2ShardLock.Unlock()
+			if !ok || sid == params.ShardTable[params.Config.ShardID] {
+				continue
+			}
+			byShard[sid] = append(byShard[sid], e)
+		}
+		for sid, txs := range byShard {
+			p.sendEscrowClientTxs(sid, txs)
 		}
 	}
 

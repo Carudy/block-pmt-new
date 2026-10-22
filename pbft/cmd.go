@@ -78,8 +78,17 @@ type TxFromClient struct {
 }
 
 // preempt_escrow：客户端发送带 nonce 的交易。
+// Seq 用于确认/重传：分片处理完回 EscrowClientAck，客户端未收到就重发同一 Seq，
+// 分片按 Seq 去重，因此重发是幂等的。
 type EscrowTxsFromClient struct {
+	Seq uint64
 	Txs []*core.EscrowTx
+}
+
+// EscrowClientAck 是分片对一次注入的确认。
+type EscrowClientAck struct {
+	ShardID int
+	Seq     uint64
 }
 
 type EscrowTerm struct {
@@ -194,6 +203,7 @@ const (
 
 	// preempt_escrow 专用命令（必须 <= 12 字节）
 	cEscrowClient  command = "escrowClient"
+	cEscrowAck     command = "escrowAck"
 	cEscrowBatch   command = "escrowBatch"
 	cEscrowQReq    command = "escrowQReq"
 	cEscrowQuies   command = "escrowQuies"

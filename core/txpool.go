@@ -89,6 +89,8 @@ type Tx_pool struct {
 
 	// 本块产生的丢弃事件（原因/ txid / nonce），由 pbft 层落地到 S*_escrow_drop.csv。
 	DropEvents []DropEvent
+	// 已结算离开本分片、但交易还滞留在队列里待转发的交易（交接瞬间的窄窗口）。
+	EscrowForward []*EscrowTx
 	// 已上报过的 nonce gap（addr -> missing nonce），避免每块重复刷日志。
 	EscrowGapSeen map[string]uint64
 }
@@ -234,6 +236,21 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 		relayTargetNotOwn := !account.AccountInOwnShard[to] && (v.IsRelay || v.Relay_Lock)
 		account.Account2ShardLock.Unlock()
 		if senderNotOwn || relayTargetNotOwn {
+			// preempt_escrow：账户已经在本分片结算离开，但交易还滞留在队列里（交接窗口）。
+			// 不丢，交给 pbft 层转发到它当前所在的分片。
+			if config.IsPreemptEscrow() && senderNotOwn && !relayTargetNotOwn && account.HasSettledEscrowRecord(from) {
+				if nu, ok := account.GetTxNonce(v.Id); ok {
+					pool.EscrowForward = append(pool.EscrowForward, &EscrowTx{Tx: v, Nonce: nu})
+					pool.Intake.ForwardedOut++
+					continue
+				}
+			}
+			// preempt_escrow：收款方正在本分片迁移/激活过程中，relay 先留在队列，
+			// 下一块再试；直接丢掉等于吞掉一笔跨分片付款。
+			if config.IsPreemptEscrow() && relayTargetNotOwn && account.InLocalEscrowFlow(to) {
+				newQueue = append(newQueue, v)
+				continue
+			}
 			// preempt_escrow：目的分片要到 Debit 提交才把 A 记为本分片账户，而客户端在
 			// Settled 提交（EscrowActivate）时就已经改路由，两者之间约有一个区块的窗口。
 			// 窗口内到达目的分片的 payer 交易必须继续往下走到 gated 缓存，不能在这里静默丢弃。
@@ -850,6 +867,18 @@ func (pool *Tx_pool) reportGapLocked(addr string, missing uint64, height int) {
 	pool.DropEvents = append(pool.DropEvents, DropEvent{
 		TxID: -1, Sender: addr, Nonce: missing, Reason: "gap", Height: height,
 	})
+}
+
+// TakeEscrowForward 取走交接窗口里需要转发的交易。
+func (pool *Tx_pool) TakeEscrowForward() []*EscrowTx {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	if len(pool.EscrowForward) == 0 {
+		return nil
+	}
+	out := pool.EscrowForward
+	pool.EscrowForward = nil
+	return out
 }
 
 // TakeDropEvents 取走本块累积的丢弃事件。
