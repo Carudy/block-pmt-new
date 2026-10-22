@@ -147,4 +147,8 @@ echo "Run finished. Stopping nodes ..."
 ./kill_block_exe.sh
 
 echo "Packaging results ..."
-N_SHARD="$num_shards" N_NODES="$num_nodes" ./zip_res.sh
+if [ "${NO_PACK:-0}" = "1" ]; then
+    echo "NO_PACK=1：跳过打包，日志保留在 ./log/（smoke_test.sh 使用）"
+else
+    N_SHARD="$num_shards" N_NODES="$num_nodes" ./zip_res.sh
+fi
