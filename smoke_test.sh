@@ -298,7 +298,15 @@ if [ "$mode" = "e2e" ]; then
             fi
         fi
 
-        restore_cfg
+        		# --- 5.5 对账（D4 口径：数据集为分母，四类互斥） ---
+        		if DATASET="$smoke_csv" ./audit_run.sh log > /tmp/smoke_audit.log 2>&1; then
+        			ok "e2e: 对账通过（committed/delegated/dropped/queued 覆盖数据集）"
+        		else
+        			bad "e2e: 对账不平（见 /tmp/smoke_audit.log）"
+        			tail -n 20 /tmp/smoke_audit.log | sed 's/^/         /'
+        		fi
+
+        		restore_cfg
         trap - EXIT
         info "e2e 运行日志: $smoke_log；结果日志保留在 ./log/ 与 ./process_logs/"
     fi

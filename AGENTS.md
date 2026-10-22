@@ -84,6 +84,9 @@ Default `params.Config.Schema` is **`SchemaPreempt`** (old bank version). Experi
 - payer txs arriving at the destination during the Settle → Debit handoff window are no longer dropped by the `FetchTxs2Pack` own-shard filter; they are buffered in `EscrowGated` (`account.InLocalEscrowFlow`). Relay/payee direction during that window is **not** covered yet.
 - txs still sitting in the source shard's normal queue when the account settles are swept into `Debit.Remaining` (`Tx_pool.TakeQueuedFor`) and replayed through gated at `S_own`, instead of being dropped at the next fetch.
 - intake ledger: `log/client_inject.csv`, `log/S*_intake.csv`, `log/S*_queue_dump.csv` + `./audit_run.sh` (see §7.3 and §9.4).
+- per-tx lifecycle log `log/S*_escrow_tx.csv` (auth / record / deliver events, joined by txid), `log/S*_escrow_drop.csv` (drop reasons), `escrow_batch`/`escrow_tx` columns on `S*_block.csv` (escrow only).
+- each `EscrowBatch` occupies exactly **1** slot of `MaxBlockSize`; batches are built before `FetchTxs2Pack` so the reservation is exact.
+- `MaxEscrowBatchTxs = 0` (unlimited) and `EscrowGapRepairBlocks = 0` (strict) are the paper defaults. With strict gaps a lost tx **stops** the run instead of being skipped; the missing nonce is logged to `S*_escrow_drop.csv` and stdout.
 
 **Not implemented (P5):**
 
@@ -332,6 +335,12 @@ For `preempt_escrow`, `pbft.NewLog` creates:
   - columns: `height,mptp,gated,pending,terminal,pending_credits`
   - `pending` = undelivered (`!Delivered`) instances; `pending_credits` = recorded-but-not-delivered delegated txs in those instances.
   - `terminal` is `AllEscrowTerminal()` only; the client’s stop condition also requires `mptp == gated == normal == 0`.
+- `log/S*_escrow_tx.csv` — one row per event, joined by `txid`:
+  `txid,sender,recipient,value,nonce,mig_id,seq,request_time,auth_height,auth_time,record_height,record_time,settle_height,deliver_height,deliver_time,deliver_shard`.
+  `auth_*` on the source at batch commit, `record_*` at the destination when the relay is applied, `deliver_*` when the recipient is credited.
+  **Shard heights are not synchronized** — compare `auth_time`/`record_time`/`deliver_time`, not the heights.
+- `log/S*_escrow_drop.csv` — `txid,sender,nonce,nu0,reason,height`; `reason` is `gap`, `duplicate`, `no_nonce`, `not_own` or `relay`. A `gap` row has no txid (the missing tx never arrived).
+- `log/S*_block.csv` gains `escrow_batch`,`escrow_tx` **only** for `preempt_escrow`; `real_tx_committed` includes the delegated txs.
 
 Existing logs (`S*_block.csv`, `S*_queueLen.csv`, `S*_transaction.csv`, etc.) remain for all schemas. Old `preempt` still writes `S*_bank.csv`.
 
@@ -494,6 +503,8 @@ Check:
 ```
 
 It enforces `injected = committed + delegated + dropped + queued + unexplained` and exits non-zero if the remainder is not 0. Use it on every run you intend to publish.
+
+**D4 semantics** (current): the denominator comes from the **dataset file**, not from the logs. `DATASET=20W.csv ./audit_run.sh` prints `dataset rows` and `dataset txs` (rows surviving the client filter), then classifies every txid into exactly one of `committed` > `delegated` > `dropped` > `queued` (that precedence order) and checks that the union equals `dataset txs`. It also reports `auth without record` and `auth without deliver` counts.
 
 Known Gate-1 baseline (ns4 / is1000 / mcb25 / nn16, full `20W.csv`):
 
