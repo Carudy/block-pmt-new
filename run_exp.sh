@@ -27,8 +27,19 @@ if [ ! -f "$csv" ]; then
     exit 1
 fi
 
-# 退出 / Ctrl-C 时清理残留节点
-trap './kill_block_exe.sh >/dev/null 2>&1 || true' EXIT INT TERM
+# 退出时清理残留节点；Ctrl-C / TERM 时终止整个批量实验（默认行为），
+# 而不是只停掉当前这一行继续跑下一个实验。
+cleanup_nodes() { ./kill_block_exe.sh >/dev/null 2>&1 || true; }
+
+on_interrupt() {
+    echo ""
+    echo "!! 收到中断信号：终止整个批量实验（不再执行后续行）" >&2
+    cleanup_nodes
+    exit 130
+}
+
+trap cleanup_nodes EXIT
+trap on_interrupt INT TERM
 
 # ---------------- 解析表头：得到各列索引（0-based；未出现的列 = -1） ----------------
 header_norm=$(head -n 1 "$csv" | tr '\t' ',')
