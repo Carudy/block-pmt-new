@@ -30,6 +30,7 @@ var (
 	// blocklog, txlog, ctxlog *csv.Writer
 	blocklog, blockexetimelog, txlog, epochChangelog, txmig2log, txmig1log, banklog *csv.Writer
 	escrowlog, escrowqueuelog                                                       *csv.Writer
+	intakelog, queuedumplog                                                         *csv.Writer
 	pbftbefore, InitTime, lastpropose                                               int64
 )
 
@@ -209,6 +210,33 @@ func NewLog(shardID string) {
 		escrowqueuelog.Write([]string{"height", "mptp", "gated", "pending", "terminal", "pending_credits"})
 		escrowqueuelog.Flush()
 	}
+
+	// 入口/丢弃计数：所有 schema 都输出，纯追加，不影响旧日志。
+	csvFile, err = os.Create("./log/" + shardID + "_intake.csv")
+	if err != nil {
+		log.Panic(err)
+	}
+	intakelog = csv.NewWriter(csvFile)
+	intakelog.Write([]string{"height", "received", "forwarded_out", "dropped_not_own", "dropped_dup", "dropped_no_nonce", "gated_in", "mptp_in", "gap_repair", "dropped_relay"})
+	intakelog.Flush()
+
+	csvFile, err = os.Create("./log/" + shardID + "_queue_dump.csv")
+	if err != nil {
+		log.Panic(err)
+	}
+	queuedumplog = csv.NewWriter(csvFile)
+	queuedumplog.Write([]string{"pool", "txid", "sender", "nonce"})
+	queuedumplog.Flush()
+}
+
+func (p *Pbft) dumpQueues() {
+	if queuedumplog == nil {
+		return
+	}
+	for _, e := range p.Node.CurChain.Tx_pool.QueueDump() {
+		queuedumplog.Write([]string{e.Pool, fmt.Sprintf("%d", e.TxID), e.Sender, fmt.Sprintf("%d", e.Nonce)})
+	}
+	queuedumplog.Flush()
 }
 
 func (p *Pbft) handleRequest(data []byte) {
@@ -266,6 +294,7 @@ func (p *Pbft) handleRequest(data []byte) {
 	case cEscrowStart:
 		go p.handleEscrowStart(content)
 	case cStop:
+		p.dumpQueues()
 		p.Stop <- 1
 	case cLLT:
 		p.handleLLT(content)

@@ -35,6 +35,7 @@ var (
 	pending_tx_set                        []*core.Transaction
 	pending_tx_set_lock                   sync.Mutex
 	migrationlog                          *csv.Writer
+	injectlog                             *csv.Writer
 	migration_count                       int
 	migration_count_lock                  sync.Mutex
 	sendtxlock                            sync.Mutex
@@ -92,6 +93,15 @@ func RunClient(path string) {
 	migrationlog = csv.NewWriter(csvFile)
 	migrationlog.Write([]string{"timestamp", "pagerank_time"})
 	migrationlog.Flush()
+
+	// 注入台账：客户端实际交给传输层的 txid 区间，用于与 transaction.csv 对账。
+	csvFile, err = os.Create("./log/" + "client_inject.csv")
+	if err != nil {
+		log.Panic(err)
+	}
+	injectlog = csv.NewWriter(csvFile)
+	injectlog.Write([]string{"timestamp", "shard", "count", "min_id", "max_id"})
+	injectlog.Flush()
 
 	txs := []*core.Transaction{}
 	if params.Config.ClientSendTX {
@@ -416,7 +426,11 @@ func handle(data []byte) {
 		if blocksize == 0 {
 			zero_count++
 			if zero_count == 5*params.Config.Shard_num {
-				if !params.Config.IsPreemptEscrow() || migration_count == 0 {
+				if params.Config.IsPreemptEscrow() && !escrowInjectionDone {
+					// 注入还没完成：此刻的空块不能当作停机凭据，否则会丢掉尚未注入的交易。
+					fmt.Println("检测到连续空块，但注入尚未完成，继续等待 ...")
+					zero_count = 0
+				} else if !params.Config.IsPreemptEscrow() || migration_count == 0 {
 					fmt.Println("收到每个分片连续5个空块，停止系统运行！")
 					all_finish <- 1
 				} else {
@@ -986,6 +1000,23 @@ func Get_Initial_Map_And_TXS(path string, Account2Shard map[string]int) []*core.
 	return txs
 }
 
+// logInjectRange 记录一次注入消息覆盖的 txid 区间。
+// 用于对账：客户端注入的 id 总数应当等于
+// 提交（transaction.csv）+ 委托（batch ntx）+ 丢弃（S*_intake.csv）+ 残留（queue_dump）。
+func logInjectRange(shardID, n, lo, hi int) {
+	if injectlog == nil || n == 0 {
+		return
+	}
+	injectlog.Write([]string{
+		fmt.Sprintf("%d", time.Now().UnixMilli()),
+		fmt.Sprintf("%d", shardID),
+		fmt.Sprintf("%d", n),
+		fmt.Sprintf("%d", lo),
+		fmt.Sprintf("%d", hi),
+	})
+	injectlog.Flush()
+}
+
 func InjectTXS(txs []*core.Transaction) {
 	cnt := 0
 	for {
@@ -1021,6 +1052,7 @@ func InjectTXS(txs []*core.Transaction) {
 
 				// fmt.Printf("正在向分片%v的主节点发送交易\n", k)
 				message := jointMessage(cClient, bc)
+				logInjectRange(params.ShardTable[k], len(ktxs), ktxs[0].Id, ktxs[len(ktxs)-1].Id)
 				go utils.TcpDial(message, target_leader)
 			}
 		}
@@ -1072,6 +1104,7 @@ func InjectEscrowTXS(txs []*core.Transaction) {
 				log.Panic(err)
 			}
 			if addr := v["N0"]; addr != "" {
+				logInjectRange(params.ShardTable[k], len(ktxs), ktxs[0].Tx.Id, ktxs[len(ktxs)-1].Tx.Id)
 				utils.TcpDial(jointMessage(cEscrowClient, b), addr)
 			}
 		}

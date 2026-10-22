@@ -83,6 +83,24 @@ type Tx_pool struct {
 	EscrowGated map[string][]*EscrowTx
 	// preempt_escrow：某账户 gated 队列首次出现（或最近一次无法推进）的块高，用于 gap repair
 	EscrowGatedSince map[string]int
+
+	// 入口/丢弃计数：仅用于实验结果对账，不改变任何打包/执行逻辑。
+	Intake IntakeStats
+}
+
+// IntakeStats 汇总本节点交易池在“进入 → 打包”之间各环节的交易计数。
+// 这些计数是累计值，按块写进 S*_intake.csv，便于把
+// “客户端注入 = 提交 + 委托 + 丢弃 + 残留” 对上。
+type IntakeStats struct {
+	Received       int64 // 进入到本节点交易池的交易（客户端注入或转发）
+	ForwardedOut   int64 // 因 sender 不属本分片而被转发出去
+	DroppedNotOwn  int64 // FetchTxs2Pack 的 own-shard 过滤丢弃（sender 不属本分片）
+	DroppedRelay   int64 // FetchTxs2Pack 丢弃的 relay（收款方不属本分片）
+	DroppedDup     int64 // 迁移账户的 payer 交易 nonce <= Nu0（已执行/重复）
+	DroppedNoNonce int64 // 找不到 nonce 侧账（数据缺失）
+	GatedIn        int64 // 进入 EscrowGated
+	MPTPIn         int64 // 进入 MPTP
+	GapRepair      int64 // gap repair 跳过的 nonce 数
 }
 
 func NewTxPool() *Tx_pool {
@@ -203,6 +221,11 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			// Settled 提交（EscrowActivate）时就已经改路由，两者之间约有一个区块的窗口。
 			// 窗口内到达目的分片的 payer 交易必须继续往下走到 gated 缓存，不能在这里静默丢弃。
 			if !(config.IsPreemptEscrow() && senderNotOwn && !relayTargetNotOwn && account.InLocalEscrowFlow(from)) {
+				if relayTargetNotOwn {
+					pool.Intake.DroppedRelay++
+				} else {
+					pool.Intake.DroppedNotOwn++
+				}
 				continue
 			}
 		}
@@ -212,13 +235,24 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			if account.IsFlowBlocked(from) {
 				if nu, ok := account.GetTxNonce(v.Id); ok {
 					pool.addEscrowGatedLocked(from, &EscrowTx{Tx: v, Nonce: nu}, blockNumber)
+					pool.Intake.GatedIn++
+				} else {
+					pool.Intake.DroppedNoNonce++
 				}
 				continue
 			}
 			if migID := account.LockedMigID(from); migID != "" {
 				if rec := account.GetEscrowRecord(migID); rec != nil {
-					if nu, ok := account.GetTxNonce(v.Id); ok && nu > rec.Nu0 {
-						pool.MPTP[from] = append(pool.MPTP[from], &EscrowTx{Tx: v, Nonce: nu})
+					if nu, ok := account.GetTxNonce(v.Id); ok {
+						if nu > rec.Nu0 {
+							pool.MPTP[from] = append(pool.MPTP[from], &EscrowTx{Tx: v, Nonce: nu})
+							pool.Intake.MPTPIn++
+						} else {
+							// nonce 不超过锁定时已执行的最后一个 nonce：属于重复/已生效，不是丢交易
+							pool.Intake.DroppedDup++
+						}
+					} else {
+						pool.Intake.DroppedNoNonce++
 					}
 				}
 				continue
@@ -226,6 +260,9 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			if account.IsFlowActive(from) {
 				if nu, ok := account.GetTxNonce(v.Id); ok {
 					pool.addEscrowGatedLocked(from, &EscrowTx{Tx: v, Nonce: nu}, blockNumber)
+					pool.Intake.GatedIn++
+				} else {
+					pool.Intake.DroppedNoNonce++
 				}
 				continue
 			}
@@ -384,6 +421,7 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 					if repair > 0 && blockNumber-since >= repair {
 						fmt.Printf("[escrow][gap-repair] account=%s missing_nonce=%d skip_to=%d height=%d\n", addr, start, e.Nonce, blockNumber)
 						account.SetLastNonce(addr, e.Nonce-1)
+						pool.Intake.GapRepair += int64(e.Nonce - start)
 						start = e.Nonce
 					} else {
 						break
@@ -730,4 +768,84 @@ func (pool *Tx_pool) QueueLen() int {
 	pool.Lock.Lock()
 	defer pool.Lock.Unlock()
 	return len(pool.Queue)
+}
+
+// TakeQueuedFor 取走普通队列中 sender == addr 的交易（连同 nonce），
+// 用于迁移结算时把还排在源分片队列里的交易一并交给 S_own。
+// 这些交易若留在源分片，会在下一个区块被 own-shard 过滤当成“别人的交易”丢掉。
+func (pool *Tx_pool) TakeQueuedFor(addr string) []*EscrowTx {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+
+	keep := make([]*Transaction, 0, len(pool.Queue))
+	out := make([]*EscrowTx, 0)
+	for _, tx := range pool.Queue {
+		if tx == nil {
+			continue
+		}
+		if hex.EncodeToString(tx.Sender) == addr {
+			if nu, ok := account.GetTxNonce(tx.Id); ok {
+				out = append(out, &EscrowTx{Tx: tx, Nonce: nu})
+				continue
+			}
+		}
+		keep = append(keep, tx)
+	}
+	if len(out) != 0 {
+		pool.Queue = keep
+	}
+	return out
+}
+
+// IntakeSnapshot 返回当前累计的入口/丢弃计数。
+func (pool *Tx_pool) IntakeSnapshot() IntakeStats {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	return pool.Intake
+}
+
+// QueueDump 导出仍留在各队列里的交易（txid / sender / nonce），
+// 用于运行结束时对账：“注入 = 提交 + 委托 + 丢弃 + 残留”里的残留部分。
+// 返回 pool 名、交易 id、sender hex、nonce（普通队列没有 nonce，记 -1）。
+type QueueDumpEntry struct {
+	Pool   string
+	TxID   int
+	Sender string
+	Nonce  int64
+}
+
+func (pool *Tx_pool) QueueDump() []QueueDumpEntry {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+
+	out := make([]QueueDumpEntry, 0, len(pool.Queue))
+	for _, tx := range pool.Queue {
+		if tx == nil {
+			continue
+		}
+		out = append(out, QueueDumpEntry{Pool: "normal", TxID: tx.Id, Sender: hex.EncodeToString(tx.Sender), Nonce: -1})
+	}
+	for addr, list := range pool.MPTP {
+		for _, e := range list {
+			if e == nil || e.Tx == nil {
+				continue
+			}
+			out = append(out, QueueDumpEntry{Pool: "mptp", TxID: e.Tx.Id, Sender: addr, Nonce: int64(e.Nonce)})
+		}
+	}
+	for addr, list := range pool.EscrowGated {
+		for _, e := range list {
+			if e == nil || e.Tx == nil {
+				continue
+			}
+			out = append(out, QueueDumpEntry{Pool: "gated", TxID: e.Tx.Id, Sender: addr, Nonce: int64(e.Nonce)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Pool != out[j].Pool {
+			return out[i].Pool < out[j].Pool
+		}
+		return out[i].TxID < out[j].TxID
+	})
+	return out
 }

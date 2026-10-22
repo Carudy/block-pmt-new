@@ -372,6 +372,23 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			blocklog.Write(strings.Split(s, " "))
 			blocklog.Flush()
 
+			if intakelog != nil {
+				st := p.Node.CurChain.Tx_pool.IntakeSnapshot()
+				intakelog.Write([]string{
+					fmt.Sprintf("%v", block.Header.Number),
+					fmt.Sprintf("%d", st.Received),
+					fmt.Sprintf("%d", st.ForwardedOut),
+					fmt.Sprintf("%d", st.DroppedNotOwn),
+					fmt.Sprintf("%d", st.DroppedDup),
+					fmt.Sprintf("%d", st.DroppedNoNonce),
+					fmt.Sprintf("%d", st.GatedIn),
+					fmt.Sprintf("%d", st.MPTPIn),
+					fmt.Sprintf("%d", st.GapRepair),
+					fmt.Sprintf("%d", st.DroppedRelay),
+				})
+				intakelog.Flush()
+			}
+
 			commitTX_numofNS := Txs_and_Num_of_New_State{
 				Txs:              commit_txs,
 				BlockSize:        len(block.TXmig1s) + len(block.TXmig2s) + len(block.Anns) + len(block.NSs) + len(block.TXborrows) + len(block.TXsettles) + len(block.TXcaravans) + len(block.Transactions),

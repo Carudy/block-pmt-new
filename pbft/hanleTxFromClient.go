@@ -75,9 +75,11 @@ func (p *Pbft) handleTxFromClient(content []byte) {
 			}
 		}
 	}
-	
+
 	txsFromClient.Txs = txsFromClient.Txs[:j]
 	p.Node.CurChain.Tx_pool.Queue = append(p.Node.CurChain.Tx_pool.Queue, txsFromClient.Txs...)
+	p.Node.CurChain.Tx_pool.Intake.Received += int64(j)
+	p.Node.CurChain.Tx_pool.Intake.ForwardedOut += int64(len(tx2))
 
 	if len(tx2) != 0 {
 		p.TrySendTX(tx2)

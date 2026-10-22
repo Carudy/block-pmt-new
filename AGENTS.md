@@ -82,6 +82,8 @@ Default `params.Config.Schema` is **`SchemaPreempt`** (old bank version). Experi
 - `S*_escrow_queue.csv`: `pending` now counts only undelivered (`!Delivered`) instances, and `pending_credits` was appended (recorded-but-not-delivered delegated txs, from `PendingRecord.PendingTxs`).
 - `zip_res.sh` writes `QuiesceDelayBlocks`, `MigrationTimeoutBlocks`, `SettlementWaitBlocks`, `MaxEscrowBatchTxs`, `EscrowGapRepairBlocks`, `EscrowInitBalance` into `log/params.txt` when the schema is `preempt_escrow` (old schemas keep the old file).
 - payer txs arriving at the destination during the Settle → Debit handoff window are no longer dropped by the `FetchTxs2Pack` own-shard filter; they are buffered in `EscrowGated` (`account.InLocalEscrowFlow`). Relay/payee direction during that window is **not** covered yet.
+- txs still sitting in the source shard's normal queue when the account settles are swept into `Debit.Remaining` (`Tx_pool.TakeQueuedFor`) and replayed through gated at `S_own`, instead of being dropped at the next fetch.
+- intake ledger: `log/client_inject.csv`, `log/S*_intake.csv`, `log/S*_queue_dump.csv` + `./audit_run.sh` (see §7.3 and §9.4).
 
 **Not implemented (P5):**
 
@@ -286,6 +288,7 @@ flowchart TD
 | `utils/` | TCP framing, address→shard, misc helpers. |
 | `run.sh`, `run_exp.sh`, `set_config.sh`, `schema_detect.sh`, `zip_res*.sh` | Experiment automation. |
 | `smoke_test.sh` | Fast checks (`gofmt`/build/unit/`bash -n`); `--e2e` adds a short run and validates the logs. |
+| `audit_run.sh` | Reconciles `client_inject.csv` against `transaction.csv`, delegated batches, intake drops and the queue dump. |
 | `clean.sh`, `kill_block_exe.sh` | Cleanup. |
 | `plan.md` | Old bank-mechanism design. |
 | `plan_preempt_escrow.md` | Current preempt_escrow design, status, limitations. |
@@ -331,6 +334,13 @@ For `preempt_escrow`, `pbft.NewLog` creates:
   - `terminal` is `AllEscrowTerminal()` only; the client’s stop condition also requires `mptp == gated == normal == 0`.
 
 Existing logs (`S*_block.csv`, `S*_queueLen.csv`, `S*_transaction.csv`, etc.) remain for all schemas. Old `preempt` still writes `S*_bank.csv`.
+
+Intake reconciliation (all schemas, purely additive):
+
+- `log/client_inject.csv` — `timestamp,shard,count,min_id,max_id`, one row per injection message (what the client handed to the transport).
+- `log/S*_intake.csv` — cumulative per shard: `received, forwarded_out, dropped_not_own, dropped_dup, dropped_no_nonce, gated_in, mptp_in, gap_repair, dropped_relay`. `dropped_relay` = relay txs dropped because the recipient is not in this shard.
+- `log/S*_queue_dump.csv` — `pool,txid,sender,nonce`, written once when the client sends `stop` (what never made it out of the queues).
+- `./audit_run.sh [log|res/xxx.zip]` checks `injected = committed + delegated + dropped + queued + unexplained` and prints the escrow counters.
 
 ### 7.4 Important invariants
 
@@ -402,6 +412,8 @@ If you implement P5, add:
 - `zip_res.sh` copies results to `/disc/home/dy/caddy/site`, an environment-specific path. It may not exist on another machine.
 - Running 16 shards × 16 nodes creates a lot of LevelDB/trie files under `intermediate/` and `record/`; `clean.sh` is mandatory between large runs.
 - The old block/PBFT path is not the active runtime path. Do not use its presence to infer consensus behavior.
+- Relay txs are routed by `account.Addr2Shard(recipient)` (the **static initial** shard) in `handleRelay`, not by `Account2Shard`. A payment to an account that has already migrated is therefore sent to the wrong shard and dropped by the `dropped_relay` branch in `FetchTxs2Pack`. Fixing this changes all schemas, so it needs an explicit decision.
+- `pending_credits` reaches 0 at Debit (settlement), not when the recipient actually receives the funds: cross-shard deliveries are synthetic relay txs and there is no ack. Treat it as “recorded but not yet settled”.
 
 ---
 
@@ -473,7 +485,26 @@ Check:
 - old `_bank.csv` still produced only for old `preempt`,
 - no `_escrow.csv` for old schemas.
 
-### 9.4 What not to run casually
+### 9.4 Intake audit
+
+```bash
+./audit_run.sh                 # 默认 ./log
+./audit_run.sh log             # 指定目录
+./audit_run.sh res/xxx.zip     # 直接核归档
+```
+
+It enforces `injected = committed + delegated + dropped + queued + unexplained` and exits non-zero if the remainder is not 0. Use it on every run you intend to publish.
+
+Known Gate-1 baseline (ns4 / is1000 / mcb25 / nn16, full `20W.csv`):
+
+| schema | injected | committed | delegated | dropped | unexplained |
+|---|---|---|---|---|---|
+| `ftl` (control) | 199,085 | 198,092 | 0 | 553 | 440 |
+| `preempt_escrow` (after the handoff fixes) | 199,085 | 175,042 | 19,261 | 1,100 relay | 3,682 |
+
+Before the `TakeQueuedFor` sweep the escrow run dropped 6,923 txs at the own-shard filter; after it, sender-side drops are 0. The remaining ~1.8 % is unexplained and is believed to be message loss on the injection/batch/settle channels (`utils.TcpDial` has no ack/retry).
+
+### 9.5 What not to run casually
 
 - Do not run the full 16-shard × 16-node matrix just to test compilation.
 - Do not run `go test ./...` expecting a clean pass; pre-existing vet warnings in old files fail it. Use `-vet=off` or targeted packages.
@@ -526,6 +557,9 @@ Check:
 | Ports occupied | `./kill_block_exe.sh`; `run.sh` auto-selects a free range, or set `PORT_BASE`. |
 | Old schema behavior changed | Search for unguarded `IsPreemptEscrow` branches or changes in old pool branches. |
 | Payer txs vanish in the Settle → Debit window | Check `account.InLocalEscrowFlow` is still consulted by the `FetchTxs2Pack` own-shard filter (`core/txpool.go`). |
+| `S*_intake.csv` shows `dropped_not_own` for a settling account | Txs were still in the source queue at settle; `Tx_pool.TakeQueuedFor` should sweep them into `Debit.Remaining`. |
+| `dropped_relay` is large | Relays are routed by `account.Addr2Shard(recipient)` (static initial shard), so payments to already-migrated accounts are sent to the wrong shard and dropped. Needs a routing decision (see §8.6). |
+| `audit_run.sh` reports unexplained txs | `utils.TcpDial` drops a message after one retry; check for holes in the injection/batch/settle channels. Run with `log/client_inject.csv` vs `S*_intake.csv` `received` to see whether the loss is client-side or shard-side. |
 
 ---
 

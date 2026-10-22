@@ -81,9 +81,17 @@ func (p *Pbft) handleEscrowTxsFromClient(content []byte) {
 			forward[sid] = append(forward[sid], e)
 		}
 	}
-	if len(local) != 0 {
+	fwd := int64(0)
+	for _, txs := range forward {
+		fwd += int64(len(txs))
+	}
+	if len(local) != 0 || fwd != 0 {
 		p.Node.CurChain.Tx_pool.Lock.Lock()
-		p.Node.CurChain.Tx_pool.Queue = append(p.Node.CurChain.Tx_pool.Queue, local...)
+		if len(local) != 0 {
+			p.Node.CurChain.Tx_pool.Queue = append(p.Node.CurChain.Tx_pool.Queue, local...)
+		}
+		p.Node.CurChain.Tx_pool.Intake.Received += int64(len(local))
+		p.Node.CurChain.Tx_pool.Intake.ForwardedOut += fwd
 		p.Node.CurChain.Tx_pool.Lock.Unlock()
 	}
 	for sid, txs := range forward {

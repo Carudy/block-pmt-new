@@ -934,7 +934,7 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 					account.SetLastNonce(rec.Account, maxU64(rec.Nu0, s.NuDst))
 					account.DeleteEscrowLock(rec.Account)
 					account.SetFlowActive(rec.Account, false)
-					debit.Remaining = bc.escrowRemainingTxs(rec, s.SM)
+					debit.Remaining = bc.escrowRemainingTxs(rec, s.SM, true)
 
 					account.Account2ShardLock.Lock()
 					account.Account2Shard[rec.Account] = owner
@@ -964,7 +964,7 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 					account.SetLastNonce(rec.Account, maxU64(rec.Nu0, s.NuDst))
 					account.DeleteEscrowLock(rec.Account)
 					account.SetFlowActive(rec.Account, true)
-					rem := bc.escrowRemainingTxs(rec, s.SM)
+					rem := bc.escrowRemainingTxs(rec, s.SM, false)
 					bc.Tx_pool.AddGatedTxs(rec.Account, rem)
 					account.Account2ShardLock.Lock()
 					account.Account2Shard[rec.Account] = owner
@@ -1307,9 +1307,14 @@ func maxU64(a, b uint64) uint64 {
 
 // escrowRemainingTxs 返回该迁移中尚未被目的分片记录的原始交易：
 // MPTP 中未授权的 + 已授权但 seq > SM（未记录）的批次。
+// sweepQueued=true 时另外取走普通队列里仍属于该账户的交易：结算后源分片不再拥有
+// 该账户，这些交易若留在队列里会被 own-shard 过滤静默丢掉。
 // 这些交易保留原 nonce，可用于退款后重放。
-func (bc *BlockChain) escrowRemainingTxs(rec *account.EscrowRecord, sm uint64) []*core.EscrowTx {
+func (bc *BlockChain) escrowRemainingTxs(rec *account.EscrowRecord, sm uint64, sweepQueued bool) []*core.EscrowTx {
 	out := bc.Tx_pool.TakeMPTP(rec.Account)
+	if sweepQueued {
+		out = append(out, bc.Tx_pool.TakeQueuedFor(rec.Account)...)
+	}
 	if m := bc.EscrowBatchArchive[rec.MigID]; m != nil {
 		for seq, b := range m {
 			if b != nil && seq > sm {
