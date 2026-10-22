@@ -253,7 +253,7 @@ var (
 		QuiesceDelayBlocks:     3,
 		SettlementWaitBlocks:   2,
 		MaxEscrowBatchTxs:      0,
-		EscrowGapRepairBlocks:  30,
+		EscrowGapRepairBlocks:  0,
 	}
 
 	Init_addrs          = []string{}

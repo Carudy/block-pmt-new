@@ -86,6 +86,23 @@ type Tx_pool struct {
 
 	// 入口/丢弃计数：仅用于实验结果对账，不改变任何打包/执行逻辑。
 	Intake IntakeStats
+
+	// 本块产生的丢弃事件（原因/ txid / nonce），由 pbft 层落地到 S*_escrow_drop.csv。
+	DropEvents []DropEvent
+	// 已上报过的 nonce gap（addr -> missing nonce），避免每块重复刷日志。
+	EscrowGapSeen map[string]uint64
+}
+
+// DropEvent 是一条“交易没有进入区块”的记录。
+// Reason: not_own | relay | duplicate | no_nonce | gap。
+// gap 事件没有 txid（缺失的那笔从未到达），Nonce 记缺失的 nonce。
+type DropEvent struct {
+	TxID   int
+	Sender string
+	Nonce  uint64
+	Nu0    uint64
+	Reason string
+	Height int
 }
 
 // IntakeStats 汇总本节点交易池在“进入 → 打包”之间各环节的交易计数。
@@ -221,10 +238,16 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			// Settled 提交（EscrowActivate）时就已经改路由，两者之间约有一个区块的窗口。
 			// 窗口内到达目的分片的 payer 交易必须继续往下走到 gated 缓存，不能在这里静默丢弃。
 			if !(config.IsPreemptEscrow() && senderNotOwn && !relayTargetNotOwn && account.InLocalEscrowFlow(from)) {
+				nu := uint64(0)
+				if n, ok := account.GetTxNonce(v.Id); ok {
+					nu = n
+				}
 				if relayTargetNotOwn {
 					pool.Intake.DroppedRelay++
+					pool.recordDropLocked(v, from, "relay", nu, 0, blockNumber)
 				} else {
 					pool.Intake.DroppedNotOwn++
+					pool.recordDropLocked(v, from, "not_own", nu, 0, blockNumber)
 				}
 				continue
 			}
@@ -238,6 +261,7 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 					pool.Intake.GatedIn++
 				} else {
 					pool.Intake.DroppedNoNonce++
+					pool.recordDropLocked(v, from, "no_nonce", 0, 0, blockNumber)
 				}
 				continue
 			}
@@ -250,9 +274,11 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 						} else {
 							// nonce 不超过锁定时已执行的最后一个 nonce：属于重复/已生效，不是丢交易
 							pool.Intake.DroppedDup++
+							pool.recordDropLocked(v, from, "duplicate", nu, rec.Nu0, blockNumber)
 						}
 					} else {
 						pool.Intake.DroppedNoNonce++
+						pool.recordDropLocked(v, from, "no_nonce", 0, rec.Nu0, blockNumber)
 					}
 				}
 				continue
@@ -263,6 +289,7 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 					pool.Intake.GatedIn++
 				} else {
 					pool.Intake.DroppedNoNonce++
+					pool.recordDropLocked(v, from, "no_nonce", 0, 0, blockNumber)
 				}
 				continue
 			}
@@ -424,6 +451,8 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 						pool.Intake.GapRepair += int64(e.Nonce - start)
 						start = e.Nonce
 					} else {
+						// 严格模式（EscrowGapRepairBlocks=0）：不跳过缺口，只上报一次，等人工定位原因。
+						pool.reportGapLocked(addr, start, blockNumber)
 						break
 					}
 				}
@@ -795,6 +824,43 @@ func (pool *Tx_pool) TakeQueuedFor(addr string) []*EscrowTx {
 	if len(out) != 0 {
 		pool.Queue = keep
 	}
+	return out
+}
+
+// recordDropLocked 记一条丢弃事件（调用方需持有 pool.Lock）。
+func (pool *Tx_pool) recordDropLocked(tx *Transaction, sender, reason string, nonce, nu0 uint64, height int) {
+	txID := -1
+	if tx != nil {
+		txID = tx.Id
+	}
+	pool.DropEvents = append(pool.DropEvents, DropEvent{
+		TxID: txID, Sender: sender, Nonce: nonce, Nu0: nu0, Reason: reason, Height: height,
+	})
+}
+
+// reportGapLocked 上报一个 nonce 缺口（同一账户同一缺口只报一次）。
+func (pool *Tx_pool) reportGapLocked(addr string, missing uint64, height int) {
+	if pool.EscrowGapSeen == nil {
+		pool.EscrowGapSeen = make(map[string]uint64)
+	}
+	if seen, ok := pool.EscrowGapSeen[addr]; ok && seen == missing {
+		return
+	}
+	pool.EscrowGapSeen[addr] = missing
+	pool.DropEvents = append(pool.DropEvents, DropEvent{
+		TxID: -1, Sender: addr, Nonce: missing, Reason: "gap", Height: height,
+	})
+}
+
+// TakeDropEvents 取走本块累积的丢弃事件。
+func (pool *Tx_pool) TakeDropEvents() []DropEvent {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	if len(pool.DropEvents) == 0 {
+		return nil
+	}
+	out := pool.DropEvents
+	pool.DropEvents = nil
 	return out
 }
 

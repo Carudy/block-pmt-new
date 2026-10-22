@@ -370,6 +370,25 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 	}
 
 	// 记录实验日志（仅 N0 创建了 writer）。
+	// 丢弃事件：strict gap / duplicate / no_nonce / not_own / relay。
+	if evs := p.Node.CurChain.Tx_pool.TakeDropEvents(); len(evs) != 0 {
+		for _, e := range evs {
+			if escrowdroplog != nil {
+				escrowdroplog.Write([]string{
+					fmt.Sprintf("%d", e.TxID), e.Sender, fmt.Sprintf("%d", e.Nonce),
+					fmt.Sprintf("%d", e.Nu0), e.Reason, fmt.Sprintf("%d", e.Height),
+				})
+			}
+			if e.Reason == "gap" {
+				fmt.Printf("[escrow][gap] shard=%s height=%d account=%s missing_nonce=%d (strict: 不跳过，等待定位)\n",
+					params.Config.ShardID, e.Height, e.Sender, e.Nonce)
+			}
+		}
+		if escrowdroplog != nil {
+			escrowdroplog.Flush()
+		}
+	}
+
 	for _, m := range block.TXmig1s {
 		if rec := account.GetEscrowRecordByAccount(m.Address); rec != nil {
 			writeEscrowLog(height, "lock", rec.MigID, rec.Account, rec.Credit, rec.Nu0, rec.Status.String(), fmt.Sprintf("h_lock=%d", rec.HLock))

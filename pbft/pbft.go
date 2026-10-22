@@ -30,6 +30,7 @@ var (
 	// blocklog, txlog, ctxlog *csv.Writer
 	blocklog, blockexetimelog, txlog, epochChangelog, txmig2log, txmig1log, banklog *csv.Writer
 	escrowlog, escrowqueuelog                                                       *csv.Writer
+	escrowdroplog                                                                   *csv.Writer
 	intakelog, queuedumplog                                                         *csv.Writer
 	pbftbefore, InitTime, lastpropose                                               int64
 )
@@ -213,6 +214,14 @@ func NewLog(shardID string) {
 		escrowqueuelog = csv.NewWriter(csvFile)
 		escrowqueuelog.Write([]string{"height", "mptp", "gated", "pending", "terminal", "pending_credits"})
 		escrowqueuelog.Flush()
+
+		csvFile, err = os.Create("./log/" + shardID + "_escrow_drop.csv")
+		if err != nil {
+			log.Panic(err)
+		}
+		escrowdroplog = csv.NewWriter(csvFile)
+		escrowdroplog.Write([]string{"txid", "sender", "nonce", "nu0", "reason", "height"})
+		escrowdroplog.Flush()
 	}
 
 	// 入口/丢弃计数：所有 schema 都输出，纯追加，不影响旧日志。
