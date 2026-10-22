@@ -221,6 +221,21 @@ type EscrowDelivery struct {
 	Recipient []byte
 	Value     *big.Int
 	IdemKey   string
+	// TxIDs 是这笔交付对应的原始交易 id（仅用于逐笔日志，不参与金额计算）。
+	TxIDs []int
+	// SettleHeight 是目的分片结算（Debit）所在高度，供收款分片写日志。
+	SettleHeight int
+}
+
+// EscrowDeliverLog 是一次交付事件，供 S*_escrow_tx.csv 逐笔记录。
+// 跨分片交付在目的分片记一笔（TxIDs 已知、height 待收款分片回填），
+// 收款分片执行时再记一笔带 height 的。
+type EscrowDeliverLog struct {
+	MigID     string
+	Recipient string
+	TxIDs     []int
+	Shard     int
+	Height    int
 }
 
 func (d *EscrowDelivery) Encode() []byte {

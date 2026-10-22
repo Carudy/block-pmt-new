@@ -64,6 +64,9 @@ var (
 	PendingRecords map[string]*PendingRecord // migID -> pending
 	FlowBlocked    map[string]bool           // account -> outgoing blocked
 	FlowActive     map[string]bool           // account -> post-cutover nonce gate active
+	// PendingTxIDs: migID -> recipient(hex) -> txid 列表。
+	// 仅用于交付阶段按 txid 记录 S*_escrow_tx.csv（pending 账本本身按收款人聚合）。
+	PendingTxIDs map[string]map[string][]int
 
 	NonceBookLock sync.Mutex
 	NonceByTxID   map[int]uint64 // tx.Id -> sender nonce
@@ -83,6 +86,7 @@ func InitEscrowState() {
 	PendingRecords = make(map[string]*PendingRecord)
 	FlowBlocked = make(map[string]bool)
 	FlowActive = make(map[string]bool)
+	PendingTxIDs = make(map[string]map[string][]int)
 	PendingLock.Unlock()
 
 	NonceBookLock.Lock()
@@ -351,6 +355,25 @@ func AddPending(migID, recipient string, value *big.Int) {
 		p.Spent.Add(p.Spent, value)
 	}
 	PendingLock.Unlock()
+}
+
+// AddPendingTxID 记下某笔委托交易的收款人，供交付阶段写逐笔日志。
+func AddPendingTxID(migID, recipient string, txID int) {
+	PendingLock.Lock()
+	if PendingTxIDs[migID] == nil {
+		PendingTxIDs[migID] = make(map[string][]int)
+	}
+	PendingTxIDs[migID][recipient] = append(PendingTxIDs[migID][recipient], txID)
+	PendingLock.Unlock()
+}
+
+// TakePendingTxIDs 取走某迁移实例的逐笔索引（交付后不再需要）。
+func TakePendingTxIDs(migID string) map[string][]int {
+	PendingLock.Lock()
+	defer PendingLock.Unlock()
+	m := PendingTxIDs[migID]
+	delete(PendingTxIDs, migID)
+	return m
 }
 
 // AddPendingTxs 记录一个批次中实际写入 pending 账本的交易笔数。

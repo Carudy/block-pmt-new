@@ -26,6 +26,7 @@ var (
 	}{M: make(map[string]map[uint64]*core.EscrowBatch)}
 
 	escrowSyntheticID int64
+	escrowTxLogLock   sync.Mutex
 	escrowDelivered   = struct {
 		sync.Mutex
 		M map[string]bool
@@ -120,10 +121,10 @@ func (p *Pbft) handleEscrowBatch(content []byte) {
 	if b == nil {
 		return
 	}
-	applyOrBufferEscrowBatch(b)
+	applyOrBufferEscrowBatch(b, p.Node.CurChain.CurrentBlock.Header.Number)
 }
 
-func applyOrBufferEscrowBatch(b *core.EscrowBatch) {
+func applyOrBufferEscrowBatch(b *core.EscrowBatch, height int) {
 	if b == nil {
 		return
 	}
@@ -145,11 +146,11 @@ func applyOrBufferEscrowBatch(b *core.EscrowBatch) {
 	if b.SeqStart < p.NextSeq {
 		return // overlapping / invalid
 	}
-	applyEscrowBatch(b)
-	drainEscrowBuffered(b.MigID)
+	applyEscrowBatch(b, height)
+	drainEscrowBuffered(b.MigID, height)
 }
 
-func applyEscrowBatch(b *core.EscrowBatch) {
+func applyEscrowBatch(b *core.EscrowBatch, height int) {
 	bid := hex.EncodeToString(b.BatchHash)
 	if !account.MarkMaterialized(b.MigID, bid) {
 		return
@@ -161,10 +162,12 @@ func applyEscrowBatch(b *core.EscrowBatch) {
 		}
 		recipient := hex.EncodeToString(e.Tx.Recipient)
 		account.AddPending(b.MigID, recipient, e.Tx.Value)
+		account.AddPendingTxID(b.MigID, recipient, e.Tx.Id)
 		pendingTxs++
 	}
 	account.AddPendingTxs(b.MigID, pendingTxs)
 	account.AdvancePendingSeq(b.MigID, b.SeqEnd, b.NonceEnd)
+	writeEscrowTxRecord(b, height)
 }
 
 func bufferEscrowBatch(b *core.EscrowBatch) {
@@ -178,7 +181,7 @@ func bufferEscrowBatch(b *core.EscrowBatch) {
 	escrowBuffered.Unlock()
 }
 
-func drainEscrowBuffered(migID string) {
+func drainEscrowBuffered(migID string, height int) {
 	for {
 		p := account.GetPendingRecord(migID)
 		if p == nil {
@@ -196,7 +199,7 @@ func drainEscrowBuffered(migID string) {
 		if b.SeqEnd < p.NextSeq {
 			continue
 		}
-		applyEscrowBatch(b)
+		applyEscrowBatch(b, height)
 	}
 }
 
@@ -287,6 +290,7 @@ func (p *Pbft) handleEscrowDeliver(content []byte) {
 		IsRelay:   true,
 	}
 	tx.TxHash = tx.Hash()
+	writeEscrowTxDeliver(d.MigID, d.TxIDs, d.SettleHeight, p.Node.CurChain.CurrentBlock.Header.Number, params.ShardTable[params.Config.ShardID])
 	p.Node.CurChain.Tx_pool.Lock.Lock()
 	p.Node.CurChain.Tx_pool.Queue = append(p.Node.CurChain.Tx_pool.Queue, tx)
 	p.Node.CurChain.Tx_pool.Lock.Unlock()
@@ -321,7 +325,7 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 
 	// 目的分片：把已 prepared 的 batch 补记录，并尝试 Freeze。
 	for _, pr := range account.AllPendingRecords() {
-		drainEscrowBuffered(pr.MigID)
+		drainEscrowBuffered(pr.MigID, height)
 		if account.FreezePending(pr.MigID, height, params.Config.SettlementWaitBlocks) {
 			snap := account.PendingSnapshot(pr.MigID)
 			if snap != nil && account.MarkSettleSent(snap.MigID) {
@@ -402,6 +406,7 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 	if block.Escrow != nil {
 		for _, b := range block.Escrow.Batches {
 			writeEscrowLog(height, "batch", b.MigID, "", b.TotalValue, b.NonceEnd, "", fmt.Sprintf("seq=%d-%d nonce=%d-%d ntx=%d", b.SeqStart, b.SeqEnd, b.NonceStart, b.NonceEnd, len(b.Txs)))
+			writeEscrowTxAuth(b, height)
 		}
 		for _, q := range block.Escrow.Quiesces {
 			// 触发原因：超时路径会把状态置为 Expired，延迟路径保持 Quiescing。
@@ -427,6 +432,15 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 			writeEscrowLog(height, "debit", d.MigID, "", d.Spent, d.NuDst, d.Status.String(), fmt.Sprintf("refund=%v flow=%v", refund, flow))
 		}
 	}
+	// 交付事件：逐笔写 deliver_height / deliver_time / deliver_shard。
+	for _, dl := range p.Node.CurChain.EscrowDeliverLogs {
+		if dl == nil {
+			continue
+		}
+		writeEscrowTxDeliver(dl.MigID, dl.TxIDs, dl.Height, dl.Height, dl.Shard)
+	}
+	p.Node.CurChain.EscrowDeliverLogs = nil
+
 	mptp, gated := p.Node.CurChain.Tx_pool.EscrowQueueStats()
 	normal := p.Node.CurChain.Tx_pool.QueueLen()
 	pendingRecords, pendingCredits := account.CountPending()
@@ -491,6 +505,92 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 
 func logEscrow(format string, args ...interface{}) {
 	fmt.Printf("[escrow] "+format+"\n", args...)
+}
+
+// writeEscrowTxAuth 在源分片 batch 提交时写逐笔授权记录。
+//
+// 注意：S*_escrow_tx.csv 会被两个 goroutine 写 —— 区块提交后的 escrowAfterCommit
+// （auth/deliver）和 relay 消息处理协程（record）。csv.Writer 不是并发安全的，
+// 一旦内部 error 被置位，后续 Write 会静默丢弃，所以必须加锁。
+func writeEscrowTxAuth(b *core.EscrowBatch, height int) {
+	if escapetxlog == nil || b == nil {
+		return
+	}
+	escrowTxLogLock.Lock()
+	defer escrowTxLogLock.Unlock()
+	now := time.Now().UnixMilli()
+	for _, e := range b.Txs {
+		if e == nil || e.Tx == nil {
+			continue
+		}
+		v := "0"
+		if e.Tx.Value != nil {
+			v = e.Tx.Value.String()
+		}
+		escapetxlog.Write([]string{
+			fmt.Sprintf("%d", e.Tx.Id),
+			hex.EncodeToString(e.Tx.Sender),
+			hex.EncodeToString(e.Tx.Recipient),
+			v,
+			fmt.Sprintf("%d", e.Nonce),
+			b.MigID,
+			fmt.Sprintf("%d", b.SeqStart),
+			fmt.Sprintf("%d", e.Tx.RequestTime-InitTime*1000),
+			fmt.Sprintf("%d", height),
+			fmt.Sprintf("%d", now),
+			"", "", "", "", "", "",
+		})
+	}
+	escapetxlog.Flush()
+}
+
+// writeEscrowTxRecord 在目的分片接受 batch 时写记录高度/时间。
+func writeEscrowTxRecord(b *core.EscrowBatch, height int) {
+	if escapetxlog == nil || b == nil {
+		return
+	}
+	escrowTxLogLock.Lock()
+	defer escrowTxLogLock.Unlock()
+	now := time.Now().UnixMilli()
+	for _, e := range b.Txs {
+		if e == nil || e.Tx == nil {
+			continue
+		}
+		escapetxlog.Write([]string{
+			fmt.Sprintf("%d", e.Tx.Id),
+			"", "", "", "",
+			b.MigID,
+			fmt.Sprintf("%d", b.SeqStart),
+			"", "", "",
+			fmt.Sprintf("%d", height),
+			fmt.Sprintf("%d", now),
+			"", "", "", "",
+		})
+	}
+	escapetxlog.Flush()
+}
+
+// writeEscrowTxDeliver 在收款方实际入账时写交付高度/时间。
+func writeEscrowTxDeliver(migID string, txIDs []int, settleHeight, height, shard int) {
+	if escapetxlog == nil || len(txIDs) == 0 {
+		return
+	}
+	escrowTxLogLock.Lock()
+	defer escrowTxLogLock.Unlock()
+	now := time.Now().UnixMilli()
+	for _, id := range txIDs {
+		escapetxlog.Write([]string{
+			fmt.Sprintf("%d", id),
+			"", "", "", "",
+			migID,
+			"", "", "", "", "", "",
+			fmt.Sprintf("%d", settleHeight),
+			fmt.Sprintf("%d", height),
+			fmt.Sprintf("%d", now),
+			fmt.Sprintf("%d", shard),
+		})
+	}
+	escapetxlog.Flush()
 }
 
 // escrowBatchCols 返回 S*_block.csv 末尾的 escrow_batch / escrow_tx 两列。

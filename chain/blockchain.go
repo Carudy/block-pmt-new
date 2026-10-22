@@ -62,6 +62,8 @@ type BlockChain struct {
 	EscrowOutDebits      []*core.EscrowDebit
 	EscrowOutActivations []*core.EscrowActivate
 	EscrowOutDeliveries  []*core.EscrowDelivery
+	// 交付事件（含 txid 列表），由 pbft 层落盘到 S*_escrow_tx.csv。
+	EscrowDeliverLogs []*core.EscrowDeliverLog
 
 	// 源分片保留已授权批次，直到结算；用于 lost-batch 回退/重放。仅新 schema 使用。
 	EscrowBatchArchive map[string]map[uint64]*core.EscrowBatch
@@ -1040,8 +1042,10 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 			}
 
 			var pending map[string]*big.Int
+			var pendingTxIDs map[string][]int
 			if commit == 1 {
 				pending = account.TakePending(d.MigID)
+				pendingTxIDs = account.TakePendingTxIDs(d.MigID)
 			} else {
 				pending = account.SnapshotPending(d.MigID)
 			}
@@ -1057,12 +1061,19 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 						rState.Balance.Add(rState.Balance, value)
 						st.Update(rAddr, rState.Encode())
 						settleState.Balance.Sub(settleState.Balance, value)
+						if commit == 1 {
+							bc.EscrowDeliverLogs = append(bc.EscrowDeliverLogs, &core.EscrowDeliverLog{
+								MigID: d.MigID, Recipient: recipientHex, TxIDs: pendingTxIDs[recipientHex],
+								Shard: selfShardID, Height: height,
+							})
+						}
 						continue
 					}
 				}
 				if commit == 1 {
 					bc.EscrowOutDeliveries = append(bc.EscrowOutDeliveries, &core.EscrowDelivery{
 						MigID: d.MigID, Recipient: rAddr, Value: new(big.Int).Set(value), IdemKey: d.MigID + ":" + recipientHex,
+						TxIDs: pendingTxIDs[recipientHex], SettleHeight: height,
 					})
 				}
 				settleState.Balance.Sub(settleState.Balance, value)
