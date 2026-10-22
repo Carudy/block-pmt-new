@@ -10,6 +10,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -285,9 +286,13 @@ func connHandler(conn net.Conn) {
 		// 创建一个字节切片来存储消息长度前缀
 		lengthPrefix := make([]byte, 4)
 
-		// 读取消息长度前缀
-		if _, err := conn.Read(lengthPrefix); err != nil {
-			log.Fatal("Error reading message length prefix:", err.Error())
+		// 读取消息长度前缀（ReadFull：长度前缀必须读满 4 字节，否则长度解析会有偏差）
+		if _, err := io.ReadFull(conn, lengthPrefix); err != nil {
+			// 对端关闭 / 连接被重置属于正常断连，不能因此 log.Fatal 终止客户端。
+			if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+				log.Println("Error reading message length prefix:", err.Error())
+			}
+			return
 		}
 
 		// 将消息长度前缀解析为一个无符号整数
@@ -298,7 +303,10 @@ func connHandler(conn net.Conn) {
 
 		// 读取消息内容
 		if _, err := io.ReadFull(conn, message); err != nil {
-			log.Fatal("Error reading message:", err.Error())
+			if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+				log.Println("Error reading message:", err.Error())
+			}
+			return
 		}
 
 		handle(message)

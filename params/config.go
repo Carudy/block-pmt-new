@@ -3,6 +3,7 @@ package params
 import (
 	"log"
 	"math/big"
+	"os"
 	"strconv"
 )
 
@@ -87,9 +88,21 @@ type ChainConfig struct {
 	BankInitialBalance *big.Int
 }
 
+// envInt 读取环境变量为 int，失败则返回默认值。
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
 var (
-	BaseIP     = "127.0.0.1"
-	StartPort  = 32000
+	BaseIP = "127.0.0.1"
+	// StartPort 为端口基址：client 用 StartPort；节点(s,n) 用 StartPort+1+s*num_nodes+n（紧凑连续分配）。
+	// 可由环境变量 PORT_BASE 覆盖（run.sh 会自动挑选空闲端口段并导出）。
+	StartPort  = envInt("PORT_BASE", 32000)
 	ClientAddr = "127.0.0.1:" + strconv.Itoa(StartPort)
 
 	// Configuration for auto-generation
@@ -104,7 +117,7 @@ var (
 			nodeTable[shardName] = make(map[string]string)
 			for n := 0; n < N_NODES; n++ {
 				nodeName := "N" + strconv.Itoa(n)
-				port := StartPort + 100*(s+1) + n
+				port := StartPort + 1 + s*N_NODES + n
 				nodeTable[shardName][nodeName] = BaseIP + ":" + strconv.Itoa(port)
 			}
 		}
@@ -142,11 +155,11 @@ var (
 		MaxCapSize:        500,
 		MaxRelayBlockSize: 10,
 		MinRelayBlockSize: 1,
-		Inject_speed:      500,
+		Inject_speed:      2000,
 		// Inject_speed:     2000,
 		Relay_interval:   1000,
 		Max_Commit:       100000,
-		Max_Commit_Block: 50,
+		Max_Commit_Block: 10,
 		// Max_Commit_Block:         30,
 		ClientSendTX:             true,
 		Stop_When_Migrating:      false,
@@ -166,10 +179,10 @@ var (
 		Not_Lock_immediately:     true,
 		RelayLock:                true,
 
-		Schema: SchemaLB,
-		// Schema:             SchemaFTL,
-		// Schema:             SchemaCaravan,
-		// Schema:             SchemaPreempt,
+		// Schema: SchemaLB,
+		// Schema: SchemaFTL,
+		// Schema: SchemaCaravan,
+		Schema: SchemaPreempt,
 		BankInitialBalance: new(big.Int).Exp(big.NewInt(10), big.NewInt(60), nil), // 10^60, 视为“无限”
 	}
 
@@ -189,7 +202,7 @@ func RenewShardTable(num_shards, num_nodes_per_shard int) {
 		NodeTable[shardName] = make(map[string]string)
 		for n := 0; n < num_nodes_per_shard; n++ {
 			nodeName := "N" + strconv.Itoa(n)
-			port := StartPort + 100*(s+1) + n
+			port := StartPort + 1 + s*num_nodes_per_shard + n
 			NodeTable[shardName][nodeName] = BaseIP + ":" + strconv.Itoa(port)
 		}
 	}

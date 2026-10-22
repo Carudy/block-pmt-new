@@ -1,6 +1,9 @@
 package params
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 // Schema 是唯一控制点：lb -> 全锁；ftl/caravan/preempt -> 半锁。
 func TestNormalizeLockFlag(t *testing.T) {
@@ -21,6 +24,28 @@ func TestNormalizeLockFlag(t *testing.T) {
 			t.Fatalf("schema %q: expected Lock_Acc_When_Migrating=%v, got %v",
 				tc.schema, tc.lock, c.Lock_Acc_When_Migrating)
 		}
+	}
+}
+
+func TestPortLayoutCompact(t *testing.T) {
+	// 紧凑端口分配：client=StartPort；节点(s,n)=StartPort+1+s*num_nodes+n
+	const shards, nodes = 3, 4
+	RenewShardTable(shards, nodes)
+	defer RenewShardTable(2, 1)
+
+	want := StartPort + 1
+	for s := 0; s < shards; s++ {
+		for n := 0; n < nodes; n++ {
+			got := NodeTable["S"+strconv.Itoa(s)]["N"+strconv.Itoa(n)]
+			expect := BaseIP + ":" + strconv.Itoa(want)
+			if got != expect {
+				t.Fatalf("node S%d_N%d: got %s, want %s", s, n, got, expect)
+			}
+			want++
+		}
+	}
+	if want-1 != StartPort+shards*nodes {
+		t.Fatalf("highest node port = %d, want %d", want-1, StartPort+shards*nodes)
 	}
 }
 

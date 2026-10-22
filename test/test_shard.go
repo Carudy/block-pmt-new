@@ -22,6 +22,7 @@ var (
 	nodeID        string
 	testFile      string
 	isClient      bool
+	findPortBase  bool
 	// requestlog    *csv.Writer
 	EndTime int64
 )
@@ -34,10 +35,23 @@ func Test_shard() {
 	flag.StringVarP(&nodeID, "nodeID", "n", "", "id of this node, for example, N0")
 	flag.StringVarP(&testFile, "testFile", "t", "", "path of the input test file")
 	flag.BoolVarP(&isClient, "client", "c", false, "whether this node is a client")
+	flag.BoolVar(&findPortBase, "find-port-base", false, "print a free port base for the given -S/-N, then exit")
 
 	flag.Parse()
 
 	params.RenewShardTable(shard_num, node_num)
+
+	// 仅寻找可用端口基址（不启动节点）：用于 run.sh 自动分配未占用端口段。
+	// 以 params.StartPort（即 PORT_BASE 环境变量，未设置时为 32000）作为首选基址，
+	// 保证与节点实际使用的 NodeTable 端口段一致。
+	if findPortBase {
+		base, err := params.FindFreePortBase(shard_num, node_num, params.StartPort)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(base)
+		return
+	}
 
 	if isClient {
 		if testFile == "" {

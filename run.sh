@@ -1,16 +1,20 @@
 #!/bin/bash
 
 # Basic Blockchain Shard Network Runner
-# Sets num_shards and num_nodes variables and starts all nodes
+
+# 中断 / 挂断 时清理节点进程，避免遗留进程占用端口（Ctrl-C / kill / 关闭终端）
+trap './kill_block_exe.sh >/dev/null 2>&1 || true; exit 130' INT TERM HUP
+
 ./kill_block_exe.sh  # Kill any existing block_exe processes
 ./clean.sh
 
 # ==== 期望运行的方案（会据此自动改写 params/config.go 的 Schema 行）：
 # lb | ftl | caravan | preempt ====
-SCHEMA=lb
+# 可被环境变量 SCHEMA 覆盖（run_exp.sh 批量实验用）： SCHEMA=ftl ./run.sh
+SCHEMA="${SCHEMA:-lb}"
 
 # rebuild（先按 SCHEMA 改写 config.go，再编译）
-./set_schema.sh "$SCHEMA" || { echo "set_schema.sh 失败，终止。"; exit 1; }
+./set_config.sh --schema "$SCHEMA" || { echo "set_config.sh 失败，终止。"; exit 1; }
 go build -o block_exe .
 
 # --- 从 params/config.go 检测当前 scheme 与注入速率 ---
@@ -24,15 +28,28 @@ fi
 echo ""
 
 # Configuration variables - edit these as needed
-num_shards=2      # Number of shards (S0, S1, S2, S3)
-num_nodes=16       # Number of nodes per shard (this branch runs one node per shard)
-malicious_num=1   # Maximum malicious nodes per shard
-test_file="20W.csv"  # Test file
+num_shards="${NUM_SHARDS:-2}"      # Number of shards (S0, S1, S2, S3)
+num_nodes="${NUM_NODES:-16}"       # Number of nodes per shard (this branch runs one node per shard)
+malicious_num="${MALICIOUS_NUM:-1}" # Maximum malicious nodes per shard
+test_file="${TEST_FILE:-20W.csv}"    # Test file
+
+# 自动挑选未被占用的端口基址（可用 PORT_BASE 环境变量覆盖）
+if [ -z "${PORT_BASE:-}" ]; then
+    # 通过“真正尝试 bind”来判定：对任何进程占用、以及临时端口(ephemeral)冲突都有效
+    PORT_BASE=$(./block_exe --find-port-base -S "$num_shards" -N "$num_nodes" 2>/dev/null)
+    if [ -z "$PORT_BASE" ]; then
+        echo "ERROR: 找不到可用端口段（需要跨度约 $((num_shards*num_nodes+1)) 个端口）。"
+        echo "       可先运行 ./kill_block_exe.sh 清理遗留进程，或用 PORT_BASE=xxxxx ./run.sh 手动指定。"
+        exit 1
+    fi
+fi
+export PORT_BASE
 
 echo "=== Starting Blockchain Shard Network ==="
 echo "Shards: $num_shards"
 echo "Nodes per shard: $num_nodes"
 echo "Malicious nodes per shard: $malicious_num"
+echo "Port base: $PORT_BASE"
 echo "Test file: $test_file"
 echo ""
 
@@ -130,4 +147,4 @@ echo "Run finished. Stopping nodes ..."
 ./kill_block_exe.sh
 
 echo "Packaging results ..."
-N_SHARD="$num_shards" ./zip_res.sh
+N_SHARD="$num_shards" N_NODES="$num_nodes" ./zip_res.sh

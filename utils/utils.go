@@ -14,6 +14,8 @@ import (
 var (
 	connMaplock sync.Mutex
 	connMap     map[string]net.Conn
+	// writeLocks 按对端地址给写入加锁，避免多 goroutine 并发写同一连接导致长度前缀粘包错乱。
+	writeLocks map[string]*sync.Mutex
 )
 
 func Addr2Shard(senderAddr string) int {
@@ -65,45 +67,81 @@ func Min(a, b int) int {
 // }
 
 // 使用tcp发送消息，利用长度前缀防止粘包
+//
+// 发送失败不再直接 log.Fatal 终止进程：缓存的连接可能因对端重启而失效，
+// 此时丢弃该连接并用新连接重试一次；仍失败只记日志（保持原有“丢消息”的降级行为）。
 func TcpDial(context []byte, addr string) {
-	// 给map加锁
-	connMaplock.Lock()
-	if connMap == nil {
-		connMap = make(map[string]net.Conn)
-	}
-	// 没有连接则先建立连接
-	if _, ok := connMap[addr]; !ok {
-		conn, err := net.Dial("tcp", addr)
-		if err != nil {
-			log.Println("connect error", err)
-			return
-		}
-		connMap[addr] = conn
-	}
-
-	conn := connMap[addr]
-	// 给map解锁
-	connMaplock.Unlock()
-
-	// 计算消息长度
-	messageLength := uint32(len(context))
-
 	// 创建一个字节切片，用于存储消息长度前缀和消息内容
 	data := make([]byte, 4+len(context))
 
 	// 将消息长度写入字节切片（使用大端序）
-	binary.BigEndian.PutUint32(data[:4], messageLength)
+	binary.BigEndian.PutUint32(data[:4], uint32(len(context)))
 
 	// 将消息内容写入字节切片
 	copy(data[4:], context)
 
-	// 发送消息
-	_, err := conn.Write(data)
-	if err != nil {
-		log.Fatal(err)
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, err := getConn(addr)
+		if err != nil {
+			log.Println("connect error", err)
+			return
+		}
 
+		// 同一连接上的写入必须串行，否则长度前缀与消息体会交错。
+		mu := writeLockFor(addr)
+		mu.Lock()
+		_, err = conn.Write(data)
+		mu.Unlock()
+		if err == nil {
+			return
+		}
+
+		log.Println("send error, 丢弃连接后重试:", err)
+		dropConn(addr, conn)
 	}
+}
 
+// getConn 返回缓存的连接，没有缓存则新建。
+func getConn(addr string) (net.Conn, error) {
+	connMaplock.Lock()
+	defer connMaplock.Unlock()
+	if connMap == nil {
+		connMap = make(map[string]net.Conn)
+	}
+	if conn, ok := connMap[addr]; ok {
+		return conn, nil
+	}
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	connMap[addr] = conn
+	return conn, nil
+}
+
+// dropConn 关闭并移除已失效的连接，下次发送时会重新建立。
+func dropConn(addr string, conn net.Conn) {
+	connMaplock.Lock()
+	if cur, ok := connMap[addr]; ok && cur == conn {
+		delete(connMap, addr)
+	}
+	connMaplock.Unlock()
+	_ = conn.Close()
+}
+
+// writeLockFor 返回 addr 对应的写锁（懒创建）。
+func writeLockFor(addr string) *sync.Mutex {
+	connMaplock.Lock()
+	defer connMaplock.Unlock()
+	if writeLocks == nil {
+		writeLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := writeLocks[addr]
+	if !ok {
+		mu = new(sync.Mutex)
+		writeLocks[addr] = mu
+	}
+	return mu
 }
 
 // 使用tcp（短链接）发送消息

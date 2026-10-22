@@ -1,0 +1,16 @@
+lb,2,500
+ftl,2,500
+caravan,2,500
+preempt,2,500
+lb,2,1000
+ftl,2,1000
+caravan,2,1000
+preempt,2,1000
+lb,4,1000
+ftl,4,1000
+caravan,4,1000
+preempt,4,1000
+lb,8,1000
+ftl,8,1000
+caravan,8,1000
+preempt,8,1000

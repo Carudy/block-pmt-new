@@ -16,6 +16,7 @@ a.out
 
 # --- Datasets (large CSV inputs) ---
 *.csv
+!exp.csv
 
 # --- METIS build/intermediate artifacts ---
 /METIS/a.out
