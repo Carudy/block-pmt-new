@@ -313,6 +313,19 @@ func IsFlowActive(addr string) bool {
 	return FlowActive[addr]
 }
 
+// InLocalEscrowFlow 报告 addr 是否正被本分片的 escrow 状态跟踪：
+// 源分片上的锁定账户，或目的分片上已 prepare 但尚未 Debit 的账户。
+// 用于在交接窗口内保留交易，避免注入路径把它们当成“别人的交易”丢掉。
+// 两步串行加锁，不嵌套两把锁，避免与其它路径形成锁序问题。
+func InLocalEscrowFlow(addr string) bool {
+	if LockedMigID(addr) != "" {
+		return true
+	}
+	PendingLock.Lock()
+	defer PendingLock.Unlock()
+	return FlowBlocked[addr] || FlowActive[addr]
+}
+
 func SetFlowActive(addr string, active bool) {
 	PendingLock.Lock()
 	if active {

@@ -3,6 +3,7 @@ package core
 import (
 	"blockEmulator/account"
 	"blockEmulator/params"
+	"encoding/hex"
 	"math/big"
 	"testing"
 )
@@ -153,6 +154,50 @@ func TestEscrowGapRepairUnblocksFlow(t *testing.T) {
 	if got := account.GetLastNonce(addr); got != 2 {
 		// Fetch 只把交易放入区块；LastNonce 在 AddBlock 执行阶段才推进。
 		t.Fatalf("gap repair should set last nonce to 2, got %d", got)
+	}
+}
+
+func TestHandoffWindowBuffersPayerTxs(t *testing.T) {
+	escrowTestSetup(t)
+	oldOwn := account.AccountInOwnShard
+	account.AccountInOwnShard = make(map[string]bool)
+	t.Cleanup(func() { account.AccountInOwnShard = oldOwn })
+
+	// 目的分片在 Debit 提交之前：A 还不是本分片账户，但 pending 记录已建立。
+	addr := "0123456789abcdef0123456789abcdef01234567"
+	sender, _ := hex.DecodeString(addr)
+	recipient, _ := hex.DecodeString("89abcdef0123456789abcdef0123456789abcdef")
+	account.PutPendingRecord(&account.PendingRecord{
+		MigID:        "mig-handoff",
+		Account:      addr,
+		SourceShard:  1,
+		DestShard:    0,
+		NextSeq:      1,
+		Pending:      make(map[string]*big.Int),
+		Materialized: make(map[string]bool),
+		Spent:        big.NewInt(0),
+	})
+	account.SetTxNonce(7, 6)
+
+	pool := NewTxPool()
+	pool.Queue = []*Transaction{{Sender: sender, Recipient: recipient, Value: big.NewInt(1), Id: 7}}
+
+	// 交接窗口：交易不能被执行，也不能被当成“别人的交易”丢掉，必须进 gated 缓存。
+	if txs, _ := pool.FetchTxs2Pack(100, 10); len(txs) != 0 {
+		t.Fatalf("handoff-window tx must not be packed before activation, got %d", len(txs))
+	}
+	if got := len(pool.EscrowGated[addr]); got != 1 {
+		t.Fatalf("handoff-window tx must be buffered in gated, got %d", got)
+	}
+
+	// Debit 提交：A 成为本分片账户，flow 激活，nonce 起点确定。
+	account.AccountInOwnShard[addr] = true
+	account.SetLastNonce(addr, 5)
+	account.SetFlowActive(addr, true)
+
+	txs, _ := pool.FetchTxs2Pack(100, 11)
+	if len(txs) != 1 || txs[0].Id != 7 {
+		t.Fatalf("buffered tx must be released after activation, got %d", len(txs))
 	}
 }
 

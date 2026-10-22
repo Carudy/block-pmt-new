@@ -195,11 +195,17 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 		from, to := hex.EncodeToString(v.Sender), hex.EncodeToString(v.Recipient)
 		// 不是自己分片的交易,直接不管了
 		account.Account2ShardLock.Lock()
-		if (!account.AccountInOwnShard[from] && !v.IsRelay && !v.Relay_Lock) || (!account.AccountInOwnShard[to] && (v.IsRelay || v.Relay_Lock)) {
-			account.Account2ShardLock.Unlock()
-			continue
-		}
+		senderNotOwn := !account.AccountInOwnShard[from] && !v.IsRelay && !v.Relay_Lock
+		relayTargetNotOwn := !account.AccountInOwnShard[to] && (v.IsRelay || v.Relay_Lock)
 		account.Account2ShardLock.Unlock()
+		if senderNotOwn || relayTargetNotOwn {
+			// preempt_escrow：目的分片要到 Debit 提交才把 A 记为本分片账户，而客户端在
+			// Settled 提交（EscrowActivate）时就已经改路由，两者之间约有一个区块的窗口。
+			// 窗口内到达目的分片的 payer 交易必须继续往下走到 gated 缓存，不能在这里静默丢弃。
+			if !(config.IsPreemptEscrow() && senderNotOwn && !relayTargetNotOwn && account.InLocalEscrowFlow(from)) {
+				continue
+			}
+		}
 
 		// preempt_escrow：迁移账户的 payer 交易进入 MPTP；迁移后的账户走 flow gate。
 		if config.IsPreemptEscrow() && !v.IsRelay && !v.Relay_Lock {
