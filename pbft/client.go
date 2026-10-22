@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -869,8 +870,13 @@ func SendNewAddr2Shard(new_addrs []string, new_addr2shard map[string]int) {
 	}
 
 	message := jointMessage(cNewMap, na)
-	migration_count++
-	fmt.Printf("\n次数：%v  时间：%v\n", migration_count, time.Now().Unix()-StartTime)
+	// 空轮次（分区算法没改变任何映射）不计入迁移次数：分片不会建立 escrow 状态，
+	// 也不会上报 terminal；若计数，客户端会一直等到超时也停不下来。
+	// 初始映射阶段（MigrateBeforeInject 关闭时）同样是空轮次，也属于这种情况。
+	if len(new_addrs) != 0 {
+		migration_count++
+		fmt.Printf("\n次数：%v  时间：%v\n", migration_count, time.Now().Unix()-StartTime)
+	}
 	for k, v := range params.NodeTable {
 		target_leader := v["N0"]
 		fmt.Printf("正在向分片%v的主节点发送新的映射\n", k)
@@ -945,7 +951,9 @@ func Get_Initial_Map_And_TXS(path string, Account2Shard map[string]int) []*core.
 		// if !ok {
 		// 	log.Panic()
 		// }
-		if path == "0to999999_BlockTransaction.csv" || path == "300W.csv" || path == "100W.csv" || path == "50W.csv" || path == "20W.csv" || path == "200W.csv" {
+		// 用 basename 判定数据集格式，允许把数据文件放在子目录（如 smoke/20W.csv），
+		// 否则带目录的路径会落到错误的分支、按错误列号解析。
+		if base := filepath.Base(path); base == "0to999999_BlockTransaction.csv" || base == "300W.csv" || base == "100W.csv" || base == "50W.csv" || base == "20W.csv" || base == "200W.csv" {
 			if row[5] != "None" || row[6] == "1" || row[7] == "1" || len(row[4][2:]) != 40 || len(row[3][2:]) != 40 || row[4] == row[3] {
 				continue
 			}
