@@ -397,6 +397,27 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 		}
 	}
 
+	// preempt_escrow：先构建本块的 batch/quiesce/settle/debit 系统操作。
+	// 每个 EscrowBatch 占 1 个 MaxBlockSize 名额（D2），所以必须在 FetchTxs2Pack
+	// 之前构建，才能把名额准确预留出来。代价：本块新进 MPTP 的交易下一块才授权。
+	var escrowData *core.EscrowBlockData
+	escrowSlots := 0
+	if params.Config.IsPreemptEscrow() {
+		escrowData = bc.buildEscrowBlockData(bc.CurrentBlock.Header.Number + 1)
+		escrowSlots = len(escrowData.Batches)
+		for _, b := range escrowData.Batches {
+			if b == nil {
+				continue
+			}
+			m := bc.EscrowBatchArchive[b.MigID]
+			if m == nil {
+				m = make(map[uint64]*core.EscrowBatch)
+				bc.EscrowBatchArchive[b.MigID] = m
+			}
+			m[b.SeqStart] = b
+		}
+	}
+
 	txs := []*core.Transaction{}
 	queueLen := 0
 	if params.Config.Cross_Chain && id != 1 {
@@ -412,12 +433,11 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 			}
 		}
 	} else if (!params.Config.Bu_Tong_Bi_Li && !params.Config.Bu_Tong_Shi_Jian && !params.Config.Fail && !params.Config.Cross_Chain) || id != 1 {
-		if params.Config.Algorithm || params.Config.Pressure {
-			txs, queueLen = bc.Tx_pool.FetchTxs2Pack(params.Config.MaxBlockSize-len(mig1s)-len(mig2s)-len(anns)-len(nss), bc.CurrentBlock.Header.Number+1)
-		} else {
-			txs, queueLen = bc.Tx_pool.FetchTxs2Pack(params.Config.MaxBlockSize-len(mig1s)-len(mig2s)-len(anns)-len(nss), bc.CurrentBlock.Header.Number+1)
-			// txs = bc.Tx_pool.FetchTxs2Pack(params.Config.MaxBlockSize - params.Config.MaxMigSize + quota)
+		left := params.Config.MaxBlockSize - len(mig1s) - len(mig2s) - len(anns) - len(nss) - escrowSlots
+		if left < 0 {
+			left = 0
 		}
+		txs, queueLen = bc.Tx_pool.FetchTxs2Pack(left, bc.CurrentBlock.Header.Number+1)
 	}
 
 	// 银行机制：取走聚合好的借款条目（payer 聚合模式）
@@ -430,24 +450,6 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 	caravans := []*core.TXcaravan{}
 	if params.Config.IsCaravan() {
 		caravans = bc.Tx_pool.FetchCaravans2Pack()
-	}
-
-	// preempt_escrow：构建本块的 batch/quiesce/settle/debit 系统操作。
-	// 必须在 FetchTxs2Pack 之后，因为本块的 payer 交易可能刚进入 MPTP。
-	var escrowData *core.EscrowBlockData
-	if params.Config.IsPreemptEscrow() {
-		escrowData = bc.buildEscrowBlockData(bc.CurrentBlock.Header.Number + 1)
-		for _, b := range escrowData.Batches {
-			if b == nil {
-				continue
-			}
-			m := bc.EscrowBatchArchive[b.MigID]
-			if m == nil {
-				m = make(map[uint64]*core.EscrowBatch)
-				bc.EscrowBatchArchive[b.MigID] = m
-			}
-			m[b.SeqStart] = b
-		}
 	}
 
 	blockHeader := &core.BlockHeader{

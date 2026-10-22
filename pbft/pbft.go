@@ -137,7 +137,11 @@ func NewLog(shardID string) {
 	}
 	// defer csvFile.Close()
 	blocklog = csv.NewWriter(csvFile)
-	blocklog.Write([]string{"timestamp", "blockHeight", "tx_total", "tx_normal", "tx_relay_sender", "tx_relay_receiver", "tx_committed", "pbfttime", "mig1", "mig2", "ann", "ns", "borrow", "borrow_tx", "caravan", "caravan_tx", "real_tx_committed", "locked_txs"})
+	blockHeaderCols := []string{"timestamp", "blockHeight", "tx_total", "tx_normal", "tx_relay_sender", "tx_relay_receiver", "tx_committed", "pbfttime", "mig1", "mig2", "ann", "ns", "borrow", "borrow_tx", "caravan", "caravan_tx", "real_tx_committed", "locked_txs"}
+	if params.Config.IsPreemptEscrow() {
+		blockHeaderCols = append(blockHeaderCols, "escrow_batch", "escrow_tx")
+	}
+	blocklog.Write(blockHeaderCols)
 	blocklog.Flush()
 
 	csvFile, err = os.Create("./log/" + shardID + "_blockexetime.csv")

@@ -638,7 +638,8 @@ func (pool *Tx_pool) BuildEscrowBatches(height int) []*EscrowBatch {
 		included := make([]*EscrowTx, 0)
 		includedIDs := make(map[int]bool)
 		for _, e := range list {
-			if len(included) >= params.Config.MaxEscrowBatchTxs {
+			// MaxEscrowBatchTxs <= 0 表示不限制，只受 nonce 连续前缀与 solvency 约束（D2）。
+			if params.Config.MaxEscrowBatchTxs > 0 && len(included) >= params.Config.MaxEscrowBatchTxs {
 				break
 			}
 			if e.Nonce < expect {

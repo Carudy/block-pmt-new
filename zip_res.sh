@@ -77,6 +77,7 @@ PARAM_FILE="log/params.txt"
         echo "mig_timeout    = ${ESC_MIG_TIMEOUT:-?}   # MigrationTimeoutBlocks"
         echo "settle_wait    = ${ESC_SETTLE_WAIT:-?}   # SettlementWaitBlocks"
         echo "max_batch_txs  = ${ESC_MAX_BATCH:-?}   # MaxEscrowBatchTxs (0 = unlimited)"
+        echo "batch_slot     = 1   # each EscrowBatch occupies 1 slot of MaxBlockSize (D2)"
         echo "gap_repair     = ${ESC_GAP_REPAIR:-?}   # EscrowGapRepairBlocks (0 = disabled)"
         echo "init_balance   = ${ESC_INIT_BAL:-?}   # EscrowInitBalance"
     fi

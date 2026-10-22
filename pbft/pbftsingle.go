@@ -330,8 +330,17 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 			txmig1log.Flush()
 			txmig2log.Flush()
 
-			// 真实处理交易数：普通 commit 交易 + 聚合的原始 payer 笔数（借款 / Caravan）（仅用于吞吐统计，不影响运行逻辑）
-			real_tx_committed := len(commit_txs) + borrow_tx + caravan_tx
+			// 真实处理交易数：普通 commit 交易 + 聚合的原始 payer 笔数（借款 / Caravan / escrow batch）（仅用于吞吐统计，不影响运行逻辑）
+			escrowBatchNum, escrowTxNum := 0, 0
+			if params.Config.IsPreemptEscrow() && block.Escrow != nil {
+				escrowBatchNum = len(block.Escrow.Batches)
+				for _, b := range block.Escrow.Batches {
+					if b != nil {
+						escrowTxNum += len(b.Txs)
+					}
+				}
+			}
+			real_tx_committed := len(commit_txs) + borrow_tx + caravan_tx + escrowTxNum
 
 			// 银行机制：记录银行余额、活跃贷款数与跨分片结算
 			if params.Config.IsPreempt() {
@@ -369,7 +378,7 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 
 			// ctxlog.Flush()
 			s = fmt.Sprintf("%v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v %v", pbftend-InitTime*1000, block.Header.Number, tx_total, tx_total-relayCount, tx_total-len(commit_txs), relayCount-tx_total+len(commit_txs), len(commit_txs), pbftend-pbftbefore, len(block.TXmig1s), len(block.TXmig2s), len(block.Anns), len(block.NSs), borrow_num, borrow_tx, caravan_num, caravan_tx, real_tx_committed, locked_cnt)
-			blocklog.Write(strings.Split(s, " "))
+			blocklog.Write(append(strings.Split(s, " "), escrowBatchCols(params.Config.IsPreemptEscrow(), escrowBatchNum, escrowTxNum)...))
 			blocklog.Flush()
 
 			if intakelog != nil {

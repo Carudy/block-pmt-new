@@ -252,7 +252,7 @@ var (
 		MigrationTimeoutBlocks: 10,
 		QuiesceDelayBlocks:     3,
 		SettlementWaitBlocks:   2,
-		MaxEscrowBatchTxs:      200,
+		MaxEscrowBatchTxs:      0,
 		EscrowGapRepairBlocks:  30,
 	}
 

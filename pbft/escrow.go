@@ -474,6 +474,15 @@ func logEscrow(format string, args ...interface{}) {
 	fmt.Printf("[escrow] "+format+"\n", args...)
 }
 
+// escrowBatchCols 返回 S*_block.csv 末尾的 escrow_batch / escrow_tx 两列。
+// 旧 schema 返回 nil，保证 lb/ftl/caravan/preempt 的日志列集完全不变。
+func escrowBatchCols(escrowSchema bool, batchNum, txNum int) []string {
+	if !escrowSchema {
+		return nil
+	}
+	return []string{fmt.Sprintf("%d", batchNum), fmt.Sprintf("%d", txNum)}
+}
+
 func writeEscrowLog(height int, event, migID, account string, value *big.Int, nu uint64, status, note string) {
 	if escrowlog == nil {
 		return
