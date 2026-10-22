@@ -241,8 +241,8 @@ var (
 		// Schema: SchemaLB,
 		// Schema: SchemaFTL,
 		// Schema: SchemaCaravan,
-		Schema: SchemaPreemptEscrow,
-		// Schema: SchemaPreempt,
+		// Schema: SchemaPreemptEscrow,
+		Schema: SchemaPreempt,
 		BankInitialBalance: new(big.Int).Exp(big.NewInt(10), big.NewInt(60), nil), // 10^60, 视为“无限”
 
 		// preempt_escrow 默认值。
