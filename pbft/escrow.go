@@ -371,7 +371,12 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 			writeEscrowLog(height, "batch", b.MigID, "", b.TotalValue, b.NonceEnd, "", fmt.Sprintf("seq=%d-%d nonce=%d-%d ntx=%d", b.SeqStart, b.SeqEnd, b.NonceStart, b.NonceEnd, len(b.Txs)))
 		}
 		for _, q := range block.Escrow.Quiesces {
-			writeEscrowLog(height, "quiesce", q.MigID, "", nil, q.NuStar, q.Status.String(), fmt.Sprintf("S*=%d", q.SStar))
+			// 触发原因：超时路径会把状态置为 Expired，延迟路径保持 Quiescing。
+			trigger := "delay"
+			if q.Status == params.EscrowExpired {
+				trigger = "timeout"
+			}
+			writeEscrowLog(height, "quiesce", q.MigID, "", nil, q.NuStar, q.Status.String(), fmt.Sprintf("S*=%d trigger=%s", q.SStar, trigger))
 		}
 		for _, s := range block.Escrow.Settles {
 			if rec := account.GetEscrowRecord(s.MigID); rec != nil {

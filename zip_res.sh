@@ -24,6 +24,16 @@ cfg_num() { sed -n "s/^[[:space:]]*$1:[[:space:]]*\([0-9][0-9]*\).*/\1/p" params
 MAX_COMMIT_BLOCK=$(cfg_num Max_Commit_Block)
 MAXBLOCK_SIZE=$(cfg_num MaxBlockSize)
 
+# preempt_escrow 的协议参数：写入 params.txt，便于复现（旧 schema 不输出，保持文件不变）
+if [ "${SCHEMA}" = "preempt_escrow" ]; then
+    ESC_QUIESCE_DELAY=$(cfg_num QuiesceDelayBlocks)
+    ESC_MIG_TIMEOUT=$(cfg_num MigrationTimeoutBlocks)
+    ESC_SETTLE_WAIT=$(cfg_num SettlementWaitBlocks)
+    ESC_MAX_BATCH=$(cfg_num MaxEscrowBatchTxs)
+    ESC_GAP_REPAIR=$(cfg_num EscrowGapRepairBlocks)
+    ESC_INIT_BAL=$(sed -n 's/^[[:space:]]*EscrowInitBalance:[[:space:]]*\(.*\),[[:space:]]*$/\1/p' params/config.go | head -n 1)
+fi
+
 # 分片数：环境变量 > run.sh（num_shards=2 或 num_shards="${NUM_SHARDS:-2}"）
 if [ -z "${N_SHARD:-}" ]; then
     N_SHARD=$(sed -n 's/^[[:space:]]*num_shards=\([0-9][0-9]*\).*/\1/p' run.sh | head -n 1)
@@ -61,6 +71,15 @@ PARAM_FILE="log/params.txt"
     echo "nn        = ${N_NODES}"
     echo "mcb       = ${MAX_COMMIT_BLOCK:-?}"
     echo "mb        = ${MAXBLOCK_SIZE:-?}"
+    if [ "${SCHEMA}" = "preempt_escrow" ]; then
+        echo "# preempt_escrow protocol knobs"
+        echo "quiesce_delay  = ${ESC_QUIESCE_DELAY:-?}   # QuiesceDelayBlocks"
+        echo "mig_timeout    = ${ESC_MIG_TIMEOUT:-?}   # MigrationTimeoutBlocks"
+        echo "settle_wait    = ${ESC_SETTLE_WAIT:-?}   # SettlementWaitBlocks"
+        echo "max_batch_txs  = ${ESC_MAX_BATCH:-?}   # MaxEscrowBatchTxs (0 = unlimited)"
+        echo "gap_repair     = ${ESC_GAP_REPAIR:-?}   # EscrowGapRepairBlocks (0 = disabled)"
+        echo "init_balance   = ${ESC_INIT_BAL:-?}   # EscrowInitBalance"
+    fi
     echo "# (ns=num_shards, is=inject_speed, nn=num_nodes, mcb=Max_Commit_Block, mb=MaxBlockSize)"
 } > "${PARAM_FILE}"
 
