@@ -143,13 +143,16 @@ func applyEscrowBatch(b *core.EscrowBatch) {
 	if !account.MarkMaterialized(b.MigID, bid) {
 		return
 	}
+	pendingTxs := 0
 	for _, e := range b.Txs {
 		if e == nil || e.Tx == nil || e.Tx.Value == nil {
 			continue
 		}
 		recipient := hex.EncodeToString(e.Tx.Recipient)
 		account.AddPending(b.MigID, recipient, e.Tx.Value)
+		pendingTxs++
 	}
+	account.AddPendingTxs(b.MigID, pendingTxs)
 	account.AdvancePendingSeq(b.MigID, b.SeqEnd, b.NonceEnd)
 }
 
@@ -396,8 +399,9 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 	}
 	mptp, gated := p.Node.CurChain.Tx_pool.EscrowQueueStats()
 	normal := p.Node.CurChain.Tx_pool.QueueLen()
+	pendingRecords, pendingCredits := account.CountPending()
 	if escrowqueuelog != nil {
-		escrowqueuelog.Write([]string{fmt.Sprintf("%d", height), fmt.Sprintf("%d", mptp), fmt.Sprintf("%d", gated), fmt.Sprintf("%d", len(account.AllPendingRecords())), fmt.Sprintf("%v", account.AllEscrowTerminal())})
+		escrowqueuelog.Write([]string{fmt.Sprintf("%d", height), fmt.Sprintf("%d", mptp), fmt.Sprintf("%d", gated), fmt.Sprintf("%d", pendingRecords), fmt.Sprintf("%v", account.AllEscrowTerminal()), fmt.Sprintf("%d", pendingCredits)})
 		escrowqueuelog.Flush()
 	}
 

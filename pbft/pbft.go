@@ -206,7 +206,7 @@ func NewLog(shardID string) {
 			log.Panic(err)
 		}
 		escrowqueuelog = csv.NewWriter(csvFile)
-		escrowqueuelog.Write([]string{"height", "mptp", "gated", "pending", "terminal"})
+		escrowqueuelog.Write([]string{"height", "mptp", "gated", "pending", "terminal", "pending_credits"})
 		escrowqueuelog.Flush()
 	}
 }

@@ -49,6 +49,7 @@ type PendingRecord struct {
 	Pending          map[string]*big.Int // recipient(hex) -> amount
 	Materialized     map[string]bool     // batch hash(hex) -> recorded
 	Spent            *big.Int            // 连续前缀批次金额之和
+	PendingTxs       int                 // 已记录但尚未交付的委托交易笔数
 	Delivered        bool
 }
 
@@ -273,6 +274,22 @@ func AllPendingRecords() []*PendingRecord {
 	return out
 }
 
+// CountPending 返回尚未交付（!Delivered）的迁移实例数，
+// 以及这些实例中已记录但尚未交付的 pending credit 笔数。
+// 已交付的实例不再计入，避免队列监控列被历史实例数污染。
+func CountPending() (records int, credits int) {
+	PendingLock.Lock()
+	defer PendingLock.Unlock()
+	for _, p := range PendingRecords {
+		if p.Delivered {
+			continue
+		}
+		records++
+		credits += p.PendingTxs
+	}
+	return records, credits
+}
+
 func GetPendingRecordByAccount(addr string) *PendingRecord {
 	PendingLock.Lock()
 	defer PendingLock.Unlock()
@@ -319,6 +336,18 @@ func AddPending(migID, recipient string, value *big.Int) {
 			p.Spent = big.NewInt(0)
 		}
 		p.Spent.Add(p.Spent, value)
+	}
+	PendingLock.Unlock()
+}
+
+// AddPendingTxs 记录一个批次中实际写入 pending 账本的交易笔数。
+func AddPendingTxs(migID string, n int) {
+	if n <= 0 {
+		return
+	}
+	PendingLock.Lock()
+	if p := PendingRecords[migID]; p != nil {
+		p.PendingTxs += n
 	}
 	PendingLock.Unlock()
 }
