@@ -15,6 +15,7 @@ func TestNormalizeLockFlag(t *testing.T) {
 		{SchemaFTL, false},
 		{SchemaCaravan, false},
 		{SchemaPreempt, false},
+		{SchemaPreemptEscrow, false},
 	}
 	for _, tc := range cases {
 		// 故意把初值设为相反值，验证 Normalize 会覆盖它。
@@ -61,11 +62,15 @@ func TestSchemaPredicates(t *testing.T) {
 		{SchemaFTL, false, true, false, false},
 		{SchemaCaravan, false, false, true, false},
 		{SchemaPreempt, false, false, false, true},
+		{SchemaPreemptEscrow, false, false, false, false},
 	}
 	for _, c := range checks {
 		cfg := &ChainConfig{Schema: c.schema}
 		if cfg.IsLB() != c.lb || cfg.IsFTL() != c.ftl || cfg.IsCaravan() != c.caravan || cfg.IsPreempt() != c.preempt {
 			t.Fatalf("predicates mismatch for schema %q", c.schema)
+		}
+		if cfg.IsPreemptEscrow() != (c.schema == SchemaPreemptEscrow) {
+			t.Fatalf("preempt_escrow predicate mismatch for schema %q", c.schema)
 		}
 	}
 }

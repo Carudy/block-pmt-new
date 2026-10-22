@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 )
@@ -75,6 +76,13 @@ type Tx_pool struct {
 
 	// 用来按迁移账户聚合“迁移完成后注入”的 payer 交易（Caravan 模式）
 	Caravan_Pool map[string]*TXcaravan
+
+	// preempt_escrow：迁移期间的 payer 交易（按账户、nonce 排序）
+	MPTP map[string][]*EscrowTx
+	// preempt_escrow：等待 flow gate / nonce 前缀的交易
+	EscrowGated map[string][]*EscrowTx
+	// preempt_escrow：某账户 gated 队列首次出现（或最近一次无法推进）的块高，用于 gap repair
+	EscrowGatedSince map[string]int
 }
 
 func NewTxPool() *Tx_pool {
@@ -88,6 +96,9 @@ func NewTxPool() *Tx_pool {
 		Coming_TX_Pools:                 make(map[string][]*Transaction),
 		Borrow_Pool:                     make(map[string]*TXborrow),
 		Caravan_Pool:                    make(map[string]*TXcaravan),
+		MPTP:                            make(map[string][]*EscrowTx),
+		EscrowGated:                     make(map[string][]*EscrowTx),
+		EscrowGatedSince:                make(map[string]int),
 	}
 	// heap.Init(&pool.Heap)
 
@@ -189,6 +200,30 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			continue
 		}
 		account.Account2ShardLock.Unlock()
+
+		// preempt_escrow：迁移账户的 payer 交易进入 MPTP；迁移后的账户走 flow gate。
+		if config.IsPreemptEscrow() && !v.IsRelay && !v.Relay_Lock {
+			if account.IsFlowBlocked(from) {
+				if nu, ok := account.GetTxNonce(v.Id); ok {
+					pool.addEscrowGatedLocked(from, &EscrowTx{Tx: v, Nonce: nu}, blockNumber)
+				}
+				continue
+			}
+			if migID := account.LockedMigID(from); migID != "" {
+				if rec := account.GetEscrowRecord(migID); rec != nil {
+					if nu, ok := account.GetTxNonce(v.Id); ok && nu > rec.Nu0 {
+						pool.MPTP[from] = append(pool.MPTP[from], &EscrowTx{Tx: v, Nonce: nu})
+					}
+				}
+				continue
+			}
+			if account.IsFlowActive(from) {
+				if nu, ok := account.GetTxNonce(v.Id); ok {
+					pool.addEscrowGatedLocked(from, &EscrowTx{Tx: v, Nonce: nu}, blockNumber)
+				}
+				continue
+			}
+		}
 
 		//如果是锁机制，所有涉及到的交易都会被锁住。即便被锁的是收钱的账户，也不会先执行扣钱部分
 		if config.Lock_Acc_When_Migrating {
@@ -312,6 +347,61 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 	}
 	pool.Queue = newQueue
 	queueLen = len(pool.Queue)
+
+	// preempt_escrow：对 flow-active 账户按 nonce 连续前缀放行。
+	if config.IsPreemptEscrow() {
+		for addr := range pool.EscrowGated {
+			if !account.IsFlowActive(addr) || account.IsFlowBlocked(addr) {
+				continue
+			}
+			start := account.GetLastNonce(addr) + 1
+			gated := pool.EscrowGated[addr]
+			sort.Slice(gated, func(i, j int) bool { return gated[i].Nonce < gated[j].Nonce })
+			since, ok := pool.EscrowGatedSince[addr]
+			if !ok {
+				since = blockNumber
+				pool.EscrowGatedSince[addr] = since
+			}
+			j := 0
+			for _, e := range gated {
+				if e.Nonce < start {
+					j++
+					continue
+				}
+				if e.Nonce > start {
+					if tx_cnt <= 0 {
+						break
+					}
+					// 可信网络原型没有 ack/retry：如果某个 nonce 丢失，后面的交易会永久卡住。
+					// 超过 EscrowGapRepairBlocks 后，把缺失 nonce 视为已丢失并跳过，保证实验可终止。
+					repair := config.EscrowGapRepairBlocks
+					if repair > 0 && blockNumber-since >= repair {
+						fmt.Printf("[escrow][gap-repair] account=%s missing_nonce=%d skip_to=%d height=%d\n", addr, start, e.Nonce, blockNumber)
+						account.SetLastNonce(addr, e.Nonce-1)
+						start = e.Nonce
+					} else {
+						break
+					}
+				}
+				if e.Nonce != start || tx_cnt <= 0 {
+					break
+				}
+				txs = append(txs, e.Tx)
+				tx_cnt--
+				start++
+				j++
+			}
+			if j >= len(gated) {
+				delete(pool.EscrowGated, addr)
+				delete(pool.EscrowGatedSince, addr)
+			} else {
+				pool.EscrowGated[addr] = gated[j:]
+				if j > 0 {
+					pool.EscrowGatedSince[addr] = blockNumber
+				}
+			}
+		}
+	}
 
 	pool.Lock.Unlock()
 	return
@@ -466,4 +556,172 @@ func TxPoolDeepCopy(dst *[]*Transaction, src []*Transaction) {
 			FromMigration:        tx.FromMigration,
 		})
 	}
+}
+
+// BuildEscrowBatches 在源分片打包前，按账户构造 nonce 连续前缀批次。
+// 只从 MPTP 取走被纳入的交易；未纳入的继续等待。记录状态由区块执行阶段更新。
+func (pool *Tx_pool) BuildEscrowBatches(height int) []*EscrowBatch {
+	if !params.Config.IsPreemptEscrow() {
+		return nil
+	}
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+
+	addrs := make([]string, 0, len(pool.MPTP))
+	for addr := range pool.MPTP {
+		addrs = append(addrs, addr)
+	}
+	sort.Strings(addrs)
+
+	out := make([]*EscrowBatch, 0)
+	for _, addr := range addrs {
+		migID := account.LockedMigID(addr)
+		if migID == "" {
+			continue
+		}
+		rec := account.GetEscrowRecord(migID)
+		if rec == nil || rec.Status != params.EscrowLocked {
+			continue
+		}
+		list := pool.MPTP[addr]
+		if len(list) == 0 {
+			continue
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].Nonce < list[j].Nonce })
+
+		expect := rec.NuCons + 1
+		totalCons := new(big.Int).Set(rec.TotalCons)
+		included := make([]*EscrowTx, 0)
+		includedIDs := make(map[int]bool)
+		for _, e := range list {
+			if len(included) >= params.Config.MaxEscrowBatchTxs {
+				break
+			}
+			if e.Nonce < expect {
+				continue // 过期/重复 nonce，跳过
+			}
+			if e.Nonce != expect {
+				break // nonce gap：后面的都不能授权
+			}
+			if e.Tx.Value == nil {
+				break
+			}
+			candidate := new(big.Int).Add(totalCons, e.Tx.Value)
+			if candidate.Cmp(rec.Credit) > 0 {
+				break // 超额度：本笔及之后全部等待
+			}
+			included = append(included, e)
+			includedIDs[e.Tx.Id] = true
+			totalCons = candidate
+			expect++
+		}
+		if len(included) == 0 {
+			continue
+		}
+
+		value := new(big.Int).Sub(totalCons, rec.TotalCons)
+		b := &EscrowBatch{
+			MigID:      migID,
+			SeqStart:   rec.SeqCons + 1,
+			SeqEnd:     rec.SeqCons + uint64(len(included)),
+			NonceStart: rec.NuCons + 1,
+			NonceEnd:   rec.NuCons + uint64(len(included)),
+			Txs:        included,
+			TotalValue: value,
+			SrcHeight:  height,
+		}
+		b.BatchHash = b.Hash()
+		out = append(out, b)
+
+		remain := make([]*EscrowTx, 0, len(list)-len(included))
+		for _, e := range list {
+			if !includedIDs[e.Tx.Id] {
+				remain = append(remain, e)
+			}
+		}
+		pool.MPTP[addr] = remain
+	}
+	return out
+}
+
+// TakeMPTP 取走某账户当前所有未授权 payer 交易（用于 Quiesce 时转交 S_own）。
+func (pool *Tx_pool) TakeMPTP(addr string) []*EscrowTx {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	out := pool.MPTP[addr]
+	delete(pool.MPTP, addr)
+	sort.Slice(out, func(i, j int) bool { return out[i].Nonce < out[j].Nonce })
+	return out
+}
+
+// PeekMPTP 返回某账户当前未授权交易的排序副本（不移除）。
+func (pool *Tx_pool) PeekMPTP(addr string) []*EscrowTx {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	out := append([]*EscrowTx(nil), pool.MPTP[addr]...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Nonce < out[j].Nonce })
+	return out
+}
+
+// MoveMPTPToGated 在 Expired 且账户留在源分片时，把未授权交易按 nonce 重新放回 flow gate。
+func (pool *Tx_pool) MoveMPTPToGated(addr string) {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	out := pool.MPTP[addr]
+	delete(pool.MPTP, addr)
+	if len(out) == 0 {
+		return
+	}
+	pool.EscrowGated[addr] = append(pool.EscrowGated[addr], out...)
+}
+
+// MergeGatedToMPTP 在账户开始新一轮迁移时，把上一轮遗留的 gated 交易重新纳入 MPTP。
+// nonce <= nu0 的交易视为已执行，直接丢弃。
+func (pool *Tx_pool) MergeGatedToMPTP(addr string, nu0 uint64) {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	gated := pool.EscrowGated[addr]
+	delete(pool.EscrowGated, addr)
+	delete(pool.EscrowGatedSince, addr)
+	for _, e := range gated {
+		if e.Nonce > nu0 {
+			pool.MPTP[addr] = append(pool.MPTP[addr], e)
+		}
+	}
+}
+
+// AddGatedTxs 把从源分片转交过来的未授权交易放入 flow gate。
+func (pool *Tx_pool) AddGatedTxs(addr string, txs []*EscrowTx) {
+	if len(txs) == 0 {
+		return
+	}
+	pool.Lock.Lock()
+	pool.EscrowGated[addr] = append(pool.EscrowGated[addr], txs...)
+	pool.Lock.Unlock()
+}
+
+func (pool *Tx_pool) addEscrowGatedLocked(addr string, e *EscrowTx, height int) {
+	if _, ok := pool.EscrowGatedSince[addr]; !ok {
+		pool.EscrowGatedSince[addr] = height
+	}
+	pool.EscrowGated[addr] = append(pool.EscrowGated[addr], e)
+}
+
+// EscrowQueueStats 返回 MPTP / flow gate 中的交易数，用于新 schema 的日志。
+func (pool *Tx_pool) EscrowQueueStats() (mptp, gated int) {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	for _, txs := range pool.MPTP {
+		mptp += len(txs)
+	}
+	for _, txs := range pool.EscrowGated {
+		gated += len(txs)
+	}
+	return
+}
+
+func (pool *Tx_pool) QueueLen() int {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	return len(pool.Queue)
 }

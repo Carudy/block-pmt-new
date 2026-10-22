@@ -45,6 +45,7 @@ resolve_schema_const() {
         ftl)             echo "SchemaFTL" ;;
         caravan)         echo "SchemaCaravan" ;;
         preempt)         echo "SchemaPreempt" ;;
+        preemptescrow)   echo "SchemaPreemptEscrow" ;;
         *) return 1 ;;
     esac
 }
@@ -56,7 +57,7 @@ set_schema_val() {
     perl -e '
         my ($target) = @ARGV;
         while (my $line = <STDIN>) {
-            if ($line =~ /^(\s*)(?:\/\/\s*)?Schema:\s*(SchemaLB|SchemaFTL|SchemaCaravan|SchemaPreempt)\b/) {
+            if ($line =~ /^(\s*)(?:\/\/\s*)?Schema:\s*(SchemaLB|SchemaFTL|SchemaCaravan|SchemaPreempt|SchemaPreemptEscrow)\b/) {
                 my ($indent, $name) = ($1, $2);
                 if ($name eq $target) { $line = $indent . "Schema: " . $name . ",\n"; }
                 else                  { $line = $indent . "// Schema: " . $name . ",\n"; }

@@ -171,8 +171,8 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 				account.Lock_Acc_Lock.Unlock()
 			}
 
-			// 不停不锁，要把账户半锁
-			if !params.Config.Stop_When_Migrating && !params.Config.Lock_Acc_When_Migrating {
+			// 不停不锁，要把账户半锁（preempt_escrow 使用自己的 EscrowLocked/MPTP，不走旧的 Outing 池）
+			if !params.Config.Stop_When_Migrating && !params.Config.Lock_Acc_When_Migrating && !params.Config.IsPreemptEscrow() {
 				account.Outing_Acc_Before_Announce_Lock.Lock()
 				for _, v := range block.TXmig1s {
 					account.Outing_Acc_Before_Announce[v.Address] = true
@@ -258,7 +258,10 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 
 			//处理要被彻底迁移出去的账户
 			// p.handleAnns(block.Anns, st1, migTree)
-			jiaoyichitime, totaltime := p.handleAnns(block.Anns, st1, migTree)
+			jiaoyichitime, totaltime := int64(0), int64(0)
+			if !params.Config.IsPreemptEscrow() {
+				jiaoyichitime, totaltime = p.handleAnns(block.Anns, st1, migTree)
+			}
 
 			// 发送relay交易，不再等待
 			if len(relaytxs) != 0 {
@@ -283,7 +286,7 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 					go p.TryTXmig1(block.TXmig1s, outbalance, st3, migTree)
 				}
 				// 通知各分片，账户已在本分片
-				if len(block.TXmig2s) != 0 {
+				if len(block.TXmig2s) != 0 && !params.Config.IsPreemptEscrow() {
 					go p.TryAnnounce(block.TXmig2s, st4, migTree)
 				}
 			}
@@ -387,6 +390,9 @@ func (p *Pbft) commit1(content []byte, pbftType string) {
 				for _, tx := range p.Node.CurChain.Tx_pool.Queue {
 					tx.RequestTime = t
 				}
+			}
+			if p.Node.nodeID == "N0" && params.Config.IsPreemptEscrow() {
+				p.escrowAfterCommit(block)
 			}
 		}
 		p.sequenceID += 1

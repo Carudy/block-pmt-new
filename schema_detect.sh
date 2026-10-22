@@ -11,6 +11,7 @@ schema_detect() {
     if   grep -Eq '^[[:space:]]*Schema:[[:space:]]*SchemaLB'      params/config.go; then SCHEMA="lb"
     elif grep -Eq '^[[:space:]]*Schema:[[:space:]]*SchemaFTL'     params/config.go; then SCHEMA="ftl"
     elif grep -Eq '^[[:space:]]*Schema:[[:space:]]*SchemaCaravan' params/config.go; then SCHEMA="caravan"
+    elif grep -Eq '^[[:space:]]*Schema:[[:space:]]*SchemaPreemptEscrow' params/config.go; then SCHEMA="preempt_escrow"
     elif grep -Eq '^[[:space:]]*Schema:[[:space:]]*SchemaPreempt' params/config.go; then SCHEMA="preempt"
     else
         echo "ERROR: params/config.go 中没有生效（未注释）的 Schema 行" >&2

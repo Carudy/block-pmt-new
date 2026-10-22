@@ -27,6 +27,8 @@ type Node struct {
 
 func NewNode() *Node {
 	node := new(Node)
+	// preempt_escrow 的进程级 map 必须在 TcpListen 之前初始化，避免早到消息访问 nil map。
+	account.InitEscrowState()
 	node.P = pbft.NewPBFT()
 
 	go node.P.TcpListen() //启动节点

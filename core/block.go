@@ -75,8 +75,10 @@ type Block struct {
 	TXborrows    []*TXborrow
 	TXsettles    []*TXsettle
 	TXcaravans   []*TXcaravan
-	Hash         []byte
-	Fee          float64
+	// preempt_escrow 专用系统操作；旧 schema 为 nil。
+	Escrow *EscrowBlockData
+	Hash   []byte
+	Fee    float64
 }
 
 // core/types/block.go
@@ -112,6 +114,16 @@ func (b *Block) PrintBlock() {
 		fmt.Printf("# of Borrows: %v\n", len(b.TXborrows))
 		fmt.Printf("# of Settles: %v\n", len(b.TXsettles))
 		fmt.Printf("# of Caravans: %v\n", len(b.TXcaravans))
+		if params.Config.IsPreemptEscrow() {
+			if b.Escrow != nil {
+				fmt.Printf("# of EscrowBatches: %v\n", len(b.Escrow.Batches))
+				fmt.Printf("# of EscrowQuiesces: %v\n", len(b.Escrow.Quiesces))
+				fmt.Printf("# of EscrowSettles: %v\n", len(b.Escrow.Settles))
+				fmt.Printf("# of EscrowDebits: %v\n", len(b.Escrow.Debits))
+			} else {
+				fmt.Printf("# of EscrowBatches: 0\n")
+			}
+		}
 	}
 	fmt.Printf("blockHash: \n")
 	fmt.Printf("%v\n", hex.EncodeToString(b.Hash))

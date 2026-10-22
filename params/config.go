@@ -13,10 +13,11 @@ import (
 type Schema string
 
 const (
-	SchemaLB      Schema = "lb"      // LB-chain：迁移时全锁账户（payer+payee 都锁），其余同 FTL
-	SchemaFTL     Schema = "ftl"     // Fine-tuned Lock：迁移中锁 payer、放行 payee；迁移完成注入目的分片后正常打包
-	SchemaCaravan Schema = "caravan" // FTL + 目的分片打包前把同账户多笔 payer 交易聚合成“单账户→多输出”交易
-	SchemaPreempt Schema = "preempt" // 银行代付：迁移中源分片聚合 payer 为借款，银行直接付给 payee
+	SchemaLB            Schema = "lb"             // LB-chain：迁移时全锁账户（payer+payee 都锁），其余同 FTL
+	SchemaFTL           Schema = "ftl"            // Fine-tuned Lock：迁移中锁 payer、放行 payee；迁移完成注入目的分片后正常打包
+	SchemaCaravan       Schema = "caravan"        // FTL + 目的分片打包前把同账户多笔 payer 交易聚合成“单账户→多输出”交易
+	SchemaPreempt       Schema = "preempt"        // 银行代付：迁移中源分片聚合 payer 为借款，银行直接付给 payee
+	SchemaPreemptEscrow Schema = "preempt_escrow" // 托管本金 + nonce 前缀授权 + pending credit + 结算（新协议，独立于银行版 preempt）
 )
 
 // IsLB 判断当前是否 LB-chain（全锁）方案。
@@ -29,7 +30,49 @@ func (c *ChainConfig) IsFTL() bool { return c.Schema == SchemaFTL }
 func (c *ChainConfig) IsCaravan() bool { return c.Schema == SchemaCaravan }
 
 // IsPreempt 判断当前是否 Preempt（银行代付）方案。
+// 注意：新协议 preempt_escrow 使用独立 predicate，绝不能让旧银行路径被新协议触发。
 func (c *ChainConfig) IsPreempt() bool { return c.Schema == SchemaPreempt }
+
+// IsPreemptEscrow 判断当前是否为托管本金版 Preempt（新协议）。
+func (c *ChainConfig) IsPreemptEscrow() bool { return c.Schema == SchemaPreemptEscrow }
+
+// EscrowStatus 是 preempt_escrow 迁移记录的状态。放在 params 包中以避免 core/account 循环依赖。
+type EscrowStatus uint8
+
+const (
+	EscrowPrepared EscrowStatus = iota
+	EscrowLocked
+	EscrowQuiescing
+	EscrowFrozen
+	EscrowSettled
+	EscrowExpired
+	EscrowDelivered
+	EscrowAborted
+)
+
+// String 便于日志输出。
+func (s EscrowStatus) String() string {
+	switch s {
+	case EscrowPrepared:
+		return "Prepared"
+	case EscrowLocked:
+		return "Locked"
+	case EscrowQuiescing:
+		return "Quiescing"
+	case EscrowFrozen:
+		return "Frozen"
+	case EscrowSettled:
+		return "Settled"
+	case EscrowExpired:
+		return "Expired"
+	case EscrowDelivered:
+		return "Delivered"
+	case EscrowAborted:
+		return "Aborted"
+	default:
+		return "Unknown"
+	}
+}
 
 // Normalize 以 Schema 为唯一控制点派生迁移开关：
 //
@@ -39,7 +82,7 @@ func (c *ChainConfig) Normalize() {
 	switch c.Schema {
 	case SchemaLB:
 		c.Lock_Acc_When_Migrating = true
-	case SchemaFTL, SchemaCaravan, SchemaPreempt:
+	case SchemaFTL, SchemaCaravan, SchemaPreempt, SchemaPreemptEscrow:
 		c.Lock_Acc_When_Migrating = false
 	}
 }
@@ -82,10 +125,26 @@ type ChainConfig struct {
 	Not_Lock_immediately     bool
 	RelayLock                bool
 
-	// 协议方案：lb / ftl / caravan / preempt。取代原来的 EnableBankMechanism 开关。
+	// 协议方案：lb / ftl / caravan / preempt / preempt_escrow。
 	Schema Schema
 	// 仅 preempt 使用：本分片银行账户的初始余额（视为“无限”）。
 	BankInitialBalance *big.Int
+
+	// 仅 preempt_escrow 使用：创世时每个账户的真实初始余额。
+	// 不要使用 10^60 之类的“无限余额”，否则 total_cons <= n 永远不会触发。
+	EscrowInitBalance *big.Int
+	// preempt_escrow：迁移锁定的源分片超时块数（h_lock + MigrationTimeoutBlocks）。
+	MigrationTimeoutBlocks int
+	// preempt_escrow：目的分片收到 TXmig2 后等待多少块再发起 Quiesce，
+	// 给源分片留出 nonce 前缀授权窗口。
+	QuiesceDelayBlocks int
+	// preempt_escrow：目的分片等待缺失批次的最长块数。
+	SettlementWaitBlocks int
+	// preempt_escrow：单个 EscrowBatch 最多包含的原始交易笔数。
+	MaxEscrowBatchTxs int
+	// preempt_escrow：gated nonce 缺口超过该块数后跳过缺失 nonce，避免实验永久卡住。
+	// 0 表示禁用（严格 nonce 语义）。可信原型推荐保留一个有限值。
+	EscrowGapRepairBlocks int
 }
 
 // envInt 读取环境变量为 int，失败则返回默认值。
@@ -182,8 +241,19 @@ var (
 		// Schema: SchemaLB,
 		// Schema: SchemaFTL,
 		// Schema: SchemaCaravan,
-		Schema: SchemaPreempt,
+		Schema: SchemaPreemptEscrow,
+		// Schema: SchemaPreempt,
 		BankInitialBalance: new(big.Int).Exp(big.NewInt(10), big.NewInt(60), nil), // 10^60, 视为“无限”
+
+		// preempt_escrow 默认值。
+		// 20W.csv 中单账户总流出最大约 5.98e24；这里用 1e26 保证旧实验默认不会因普通余额不足卡死。
+		// 要验证 total_cons <= n 的论文语义，请通过 set_config/配置将该值调小或使用校准后的数据集。
+		EscrowInitBalance:      new(big.Int).Exp(big.NewInt(10), big.NewInt(26), nil),
+		MigrationTimeoutBlocks: 10,
+		QuiesceDelayBlocks:     3,
+		SettlementWaitBlocks:   2,
+		MaxEscrowBatchTxs:      200,
+		EscrowGapRepairBlocks:  30,
 	}
 
 	Init_addrs          = []string{}

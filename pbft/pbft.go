@@ -29,6 +29,7 @@ import (
 var (
 	// blocklog, txlog, ctxlog *csv.Writer
 	blocklog, blockexetimelog, txlog, epochChangelog, txmig2log, txmig1log, banklog *csv.Writer
+	escrowlog, escrowqueuelog                                                       *csv.Writer
 	pbftbefore, InitTime, lastpropose                                               int64
 )
 
@@ -182,13 +183,31 @@ func NewLog(shardID string) {
 	txmig2log.Flush()
 
 	if params.Config.IsPreempt() {
-		csvFile, err = os.Create("./log/" + shardID + "_bank.csv")
+		csvFile, err := os.Create("./log/" + shardID + "_bank.csv")
 		if err != nil {
 			log.Panic(err)
 		}
 		banklog = csv.NewWriter(csvFile)
 		banklog.Write([]string{"blockHeight", "bank_balance", "active_loans", "settled_out", "settled_in", "real_tx_committed"})
 		banklog.Flush()
+	}
+
+	if params.Config.IsPreemptEscrow() {
+		csvFile, err := os.Create("./log/" + shardID + "_escrow.csv")
+		if err != nil {
+			log.Panic(err)
+		}
+		escrowlog = csv.NewWriter(csvFile)
+		escrowlog.Write([]string{"timestamp", "height", "event", "mig_id", "account", "value", "nu", "status", "note"})
+		escrowlog.Flush()
+
+		csvFile, err = os.Create("./log/" + shardID + "_escrow_queue.csv")
+		if err != nil {
+			log.Panic(err)
+		}
+		escrowqueuelog = csv.NewWriter(csvFile)
+		escrowqueuelog.Write([]string{"height", "mptp", "gated", "pending", "terminal"})
+		escrowqueuelog.Flush()
 	}
 }
 
@@ -228,6 +247,24 @@ func (p *Pbft) handleRequest(data []byte) {
 		p.handleSure(content)
 	case cSettle:
 		go p.handleSettle(content)
+	case cEscrowClient:
+		go p.handleEscrowTxsFromClient(content)
+	case cEscrowBatch:
+		go p.handleEscrowBatch(content)
+	case cEscrowQReq:
+		go p.handleEscrowQuiesceReq(content)
+	case cEscrowQuies:
+		go p.handleEscrowQuiesce(content)
+	case cEscrowSettle:
+		go p.handleEscrowSettle(content)
+	case cEscrowDebit:
+		go p.handleEscrowDebit(content)
+	case cEscrowActive:
+		go p.handleEscrowActivate(content)
+	case cEscrowDeliver:
+		go p.handleEscrowDeliver(content)
+	case cEscrowStart:
+		go p.handleEscrowStart(content)
 	case cStop:
 		p.Stop <- 1
 	case cLLT:
@@ -1317,9 +1354,9 @@ func (p *Pbft) TryTXmig1(txmig1s []*core.TXmig1, outbalance map[string]*big.Int,
 		}
 
 		if config.Cross_Chain && !config.Fail && len(txmig1s) != 0 {
-			p.TryOutPool[shardID] = append(p.TryOutPool[shardID], &core.TXmig2{Txmig1: v, MPmig1: proofDB1, State: account.DecodeAccountState(encoded), MPstate: proofDB2, Address: v.Address, Value: new(big.Int).Set(outbalance[v.Address])})
+			p.TryOutPool[shardID] = append(p.TryOutPool[shardID], &core.TXmig2{Txmig1: v, MPmig1: proofDB1, State: account.DecodeAccountState(encoded), MPstate: proofDB2, Address: v.Address, Value: new(big.Int).Set(outbalance[v.Address]), MigID: escrowMigIDFor(v.Address)})
 		} else {
-			txmig2pool[shardID] = append(txmig2pool[shardID], &core.TXmig2{Txmig1: v, MPmig1: proofDB1, State: account.DecodeAccountState(encoded), MPstate: proofDB2, Address: v.Address, Value: new(big.Int).Set(outbalance[v.Address])})
+			txmig2pool[shardID] = append(txmig2pool[shardID], &core.TXmig2{Txmig1: v, MPmig1: proofDB1, State: account.DecodeAccountState(encoded), MPstate: proofDB2, Address: v.Address, Value: new(big.Int).Set(outbalance[v.Address]), MigID: escrowMigIDFor(v.Address)})
 		}
 	}
 

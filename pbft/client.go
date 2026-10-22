@@ -46,6 +46,16 @@ var (
 	zero_count                            int
 	zero_count_lock                       sync.Mutex
 	onlyOnce_lock                         sync.Mutex
+
+	// preempt_escrow 客户端状态（旧 schema 不使用）
+	escrowClientNonces  map[int]uint64
+	escrowClientEpoch   int
+	escrowStartTime     int64
+	escrowInjectionDone bool
+	escrowFinishOnce    bool
+	escrowTermEpoch     map[string]int
+	escrowBusyShards    map[string]bool
+	escrowClientLock    sync.Mutex
 )
 
 func RunClient(path string) {
@@ -61,8 +71,16 @@ func RunClient(path string) {
 	num_of_unfinished_migrated_TXs = 0
 	num_of_shard_not_sending_pending = params.Config.Shard_num
 	zero_count = 0
+	escrowClientNonces = make(map[int]uint64)
+	escrowTermEpoch = make(map[string]int)
+	escrowBusyShards = make(map[string]bool)
+	escrowInjectionDone = false
+	escrowFinishOnce = false
+	escrowClientEpoch = 0
+	escrowStartTime = 0
 
 	account.Account2Shard = make(map[string]int)
+	account.InitEscrowState()
 	go listener()
 
 	csvFile, err := os.Create("./log/" + "migration.csv")
@@ -184,6 +202,15 @@ func RunClient(path string) {
 		Get_Initial_Map(path, account.Account2Shard)
 	}
 
+	if params.Config.IsPreemptEscrow() {
+		seq := make(map[string]uint64)
+		for _, tx := range txs {
+			from := hex.EncodeToString(tx.Sender)
+			seq[from]++
+			escrowClientNonces[tx.Id] = seq[from]
+		}
+	}
+
 	// //10W笔交易注入完停止
 	// var counttime func(int64) = func(t int64) {
 	// 	//打包所有类型交易
@@ -209,7 +236,17 @@ func RunClient(path string) {
 		for time.Now().Unix()-StartTime != 2 {
 
 		}
-		go InjectTXS(txs)
+		if params.Config.IsPreemptEscrow() {
+			go func() {
+				InjectEscrowTXS(txs)
+				escrowClientLock.Lock()
+				escrowInjectionDone = true
+				escrowClientLock.Unlock()
+				checkEscrowFinish()
+			}()
+		} else {
+			go InjectTXS(txs)
+		}
 	}
 
 	// go counttime(StartTime)
@@ -378,8 +415,13 @@ func handle(data []byte) {
 		if blocksize == 0 {
 			zero_count++
 			if zero_count == 5*params.Config.Shard_num {
-				fmt.Println("收到每个分片连续5个空块，停止系统运行！")
-				all_finish <- 1
+				if !params.Config.IsPreemptEscrow() || migration_count == 0 {
+					fmt.Println("收到每个分片连续5个空块，停止系统运行！")
+					all_finish <- 1
+				} else {
+					fmt.Println("收到每个分片连续5个空块，等待 preempt_escrow 迁移 drain...")
+					go checkEscrowFinish()
+				}
 			}
 		} else {
 			zero_count = 0
@@ -606,6 +648,44 @@ func handle(data []byte) {
 		num_of_unfinished_migration -= UnchangedState
 		num_of_unfinished_migration_lock.Unlock()
 
+	case cEscrowActive:
+		a := core.DecodeEscrowActivate(content)
+		if a == nil {
+			break
+		}
+		sendtxlock.Lock()
+		account.Account2ShardLock.Lock()
+		account.Account2Shard[a.Address] = a.DestShard
+		account.Account2ShardLock.Unlock()
+		sendtxlock.Unlock()
+		account.SetLastNonce(a.Address, a.NuStart)
+
+	case cEscrowTerm:
+		var t EscrowTerm
+		if err := json.Unmarshal(content, &t); err != nil {
+			log.Panic(err)
+		}
+		escrowClientLock.Lock()
+		if t.Epoch == escrowClientEpoch {
+			escrowTermEpoch[t.ShardID] = t.Epoch
+			escrowBusyShards[t.ShardID] = false
+		}
+		escrowClientLock.Unlock()
+		checkEscrowFinish()
+
+	case cEscrowBusy:
+		var b EscrowBusy
+		if err := json.Unmarshal(content, &b); err != nil {
+			log.Panic(err)
+		}
+		escrowClientLock.Lock()
+		if b.Epoch == escrowClientEpoch {
+			escrowBusyShards[b.ShardID] = true
+			// busy 后该 shard 的旧 terminal 不再有效
+			delete(escrowTermEpoch, b.ShardID)
+		}
+		escrowClientLock.Unlock()
+
 	default:
 		log.Panic()
 	}
@@ -714,6 +794,10 @@ func SendMigrateWanted() {
 	// 	log.Panic(err)
 	// }
 
+	if params.Config.IsPreemptEscrow() {
+		SendEscrowStart()
+	}
+
 	message := jointMessage(cMigrateWanted, nil)
 
 	for k, v := range params.NodeTable {
@@ -724,6 +808,57 @@ func SendMigrateWanted() {
 		fmt.Printf("正在向分片%v的主节点发送MigrateWanted消息\n", k)
 		go utils.TcpDial(message, target_leader)
 	}
+}
+
+// SendEscrowStart 在每轮迁移开始时广播 epoch，让空闲分片也参与 terminal 统计。
+func SendEscrowStart() {
+	escrowClientLock.Lock()
+	escrowClientEpoch++
+	epoch := escrowClientEpoch
+	escrowStartTime = time.Now().Unix()
+	escrowTermEpoch = make(map[string]int)
+	escrowBusyShards = make(map[string]bool)
+	escrowClientLock.Unlock()
+
+	b, _ := json.Marshal(EscrowStart{Epoch: epoch})
+	for _, v := range params.NodeTable {
+		if addr := v["N0"]; addr != "" {
+			utils.TcpDial(jointMessage(cEscrowStart, b), addr)
+		}
+	}
+}
+
+// checkEscrowFinish 等所有分片在当前 epoch 上报 terminal 且无 busy。
+func checkEscrowFinish() {
+	if !params.Config.IsPreemptEscrow() {
+		return
+	}
+	escrowClientLock.Lock()
+	if escrowFinishOnce || !escrowInjectionDone {
+		escrowClientLock.Unlock()
+		return
+	}
+	// 给源分片至少一个块的时间创建 escrow/busy，避免在迁移真正开始前
+	// 因空闲分片过早上报 terminal 而停止。
+	if time.Now().Unix()-escrowStartTime < 2*int64(params.Config.Block_interval) {
+		escrowClientLock.Unlock()
+		return
+	}
+	if len(escrowTermEpoch) < params.Config.Shard_num {
+		escrowClientLock.Unlock()
+		return
+	}
+	for shard := range params.NodeTable {
+		if escrowTermEpoch[shard] != escrowClientEpoch || escrowBusyShards[shard] {
+			escrowClientLock.Unlock()
+			return
+		}
+	}
+	escrowFinishOnce = true
+	escrowClientLock.Unlock()
+
+	fmt.Println("preempt_escrow: 所有分片迁移均为 terminal，停止系统运行")
+	all_finish <- 1
 }
 
 func SendNewAddr2Shard(new_addrs []string, new_addr2shard map[string]int) {
@@ -890,6 +1025,52 @@ func InjectTXS(txs []*core.Transaction) {
 			// fmt.Println("注入10000")
 			fmt.Printf("注入%v\n", cnt)
 			fmt.Println()
+			break
+		}
+	}
+}
+
+// InjectEscrowTXS 是 preempt_escrow 的客户端注入路径：按数据集顺序发送，
+// 并携带每个 sender 的确定性 nonce。每个批次对各分片串行发送，避免同 sender 乱序。
+func InjectEscrowTXS(txs []*core.Transaction) {
+	cnt := 0
+	for {
+		inject_speed := params.Config.Inject_speed
+		time.Sleep(2 * time.Second)
+		upperBound := utils.Min(cnt+2*inject_speed, len(txs))
+
+		sendtxlock.Lock()
+		account.Account2ShardLock.Lock()
+		to_send := make([][]*core.EscrowTx, params.Config.Shard_num)
+		for i := cnt; i < upperBound; i++ {
+			tx := txs[i]
+			addr := hex.EncodeToString(tx.Sender)
+			senderSID := account.Account2Shard[addr]
+			tx.RequestTime = time.Now().UnixMilli()
+			tx.TxHash = tx.Hash()
+			nonce := escrowClientNonces[tx.Id]
+			to_send[senderSID] = append(to_send[senderSID], &core.EscrowTx{Tx: tx, Nonce: nonce})
+		}
+		account.Account2ShardLock.Unlock()
+		sendtxlock.Unlock()
+
+		for k, v := range params.NodeTable {
+			ktxs := to_send[params.ShardTable[k]]
+			if len(ktxs) == 0 {
+				continue
+			}
+			b, err := json.Marshal(EscrowTxsFromClient{Txs: ktxs})
+			if err != nil {
+				log.Panic(err)
+			}
+			if addr := v["N0"]; addr != "" {
+				utils.TcpDial(jointMessage(cEscrowClient, b), addr)
+			}
+		}
+
+		cnt = upperBound
+		if cnt == len(txs) {
+			fmt.Printf("注入%v\n", cnt)
 			break
 		}
 	}

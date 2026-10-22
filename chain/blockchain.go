@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,6 +52,19 @@ type BlockChain struct {
 	TXns_pool *core.TXns_pool
 
 	TXsettle_pool *core.TXsettle_pool
+
+	// preempt_escrow 专用池/出站队列（旧 schema 不使用）
+	EscrowQuiesceReq_pool *core.EscrowQuiesceReqPool
+	EscrowQuiesce_pool    *core.EscrowQuiescePool
+	EscrowSettle_pool     *core.EscrowSettlePool
+	EscrowDebit_pool      *core.EscrowDebitPool
+
+	EscrowOutDebits      []*core.EscrowDebit
+	EscrowOutActivations []*core.EscrowActivate
+	EscrowOutDeliveries  []*core.EscrowDelivery
+
+	// 源分片保留已授权批次，直到结算；用于 lost-batch 回退/重放。仅新 schema 使用。
+	EscrowBatchArchive map[string]map[uint64]*core.EscrowBatch
 }
 
 func NewBlockChain(chainConfig *params.ChainConfig) (*BlockChain, error) {
@@ -86,6 +100,12 @@ func NewBlockChain(chainConfig *params.ChainConfig) (*BlockChain, error) {
 		TXann_pool:    core.NewTXannPool(),
 		TXns_pool:     core.NewTXnsPool(),
 		TXsettle_pool: core.NewTXsettlePool(),
+
+		EscrowQuiesceReq_pool: core.NewEscrowQuiesceReqPool(),
+		EscrowQuiesce_pool:    core.NewEscrowQuiescePool(),
+		EscrowSettle_pool:     core.NewEscrowSettlePool(),
+		EscrowDebit_pool:      core.NewEscrowDebitPool(),
+		EscrowBatchArchive:    make(map[string]map[uint64]*core.EscrowBatch),
 	}
 	//filepath
 	fp := "./record/triedb/" + chainConfig.ShardID + "_" + chainConfig.NodeID
@@ -138,23 +158,50 @@ func (bc *BlockChain) AddBlock(block *core.Block) map[string]*big.Int {
 	var outbalance map[string]*big.Int
 
 	if !bc.ChainConfig.Stop_When_Migrating {
-		// 将迁入账户映射到本分片
-		for _, v := range block.TXmig2s {
-			account.Account2ShardLock.Lock()
-			account.Account2Shard[v.Address] = params.ShardTable[params.Config.ShardID]
-			account.AccountInOwnShard[v.Address] = true
-			account.Account2ShardLock.Unlock()
+		if bc.ChainConfig.IsPreemptEscrow() {
+			// 新协议：TXmig2 只创建目的分片的 Prepared 记录，不改账户归属。
+			for _, v := range block.TXmig2s {
+				if v == nil || v.Txmig1 == nil {
+					continue
+				}
+				if v.MigID == "" {
+					continue
+				}
+				if account.GetPendingRecord(v.MigID) != nil {
+					continue
+				}
+				account.PutPendingRecord(&account.PendingRecord{
+					MigID:          v.MigID,
+					Account:        v.Txmig1.Address,
+					SourceShard:    v.Txmig1.FromshardID,
+					DestShard:      v.Txmig1.ToshardID,
+					NextSeq:        1,
+					Status:         params.EscrowPrepared,
+					PreparedHeight: block.Header.Number,
+					Pending:        make(map[string]*big.Int),
+					Materialized:   make(map[string]bool),
+					Spent:          big.NewInt(0),
+				})
+			}
+		} else {
+			// 将迁入账户映射到本分片
+			for _, v := range block.TXmig2s {
+				account.Account2ShardLock.Lock()
+				account.Account2Shard[v.Address] = params.ShardTable[params.Config.ShardID]
+				account.AccountInOwnShard[v.Address] = true
+				account.Account2ShardLock.Unlock()
+			}
 		}
 	}
 
 	updatetree := time.Now().UnixMilli()
-	stateroothash, outbalance := bc.getUpdatedTreeOfState(1, block.Header.Number, block.Transactions, block.TXmig1s, block.TXmig2s, block.Anns, block.NSs, block.TXborrows, block.TXsettles, block.TXcaravans)
+	stateroothash, outbalance := bc.getUpdatedTreeOfState(1, block.Header.Number, block.Transactions, block.TXmig1s, block.TXmig2s, block.Anns, block.NSs, block.TXborrows, block.TXsettles, block.TXcaravans, block.Escrow)
 	if !bytes.Equal(block.Header.StateRoot, stateroothash) {
 		log.Panicf("二者不等，Ins长度为%v\n", len(block.TXmig2s))
 	}
 	fmt.Printf("更新树花时间为: %v\n", time.Now().UnixMilli()-updatetree)
 
-	if !bc.ChainConfig.Stop_When_Migrating && params.Config.NodeID != "N0" {
+	if !bc.ChainConfig.Stop_When_Migrating && params.Config.NodeID != "N0" && !bc.ChainConfig.IsPreemptEscrow() {
 		// 将删除账户从本分片映射删去，并设为对应分片
 		for _, v := range block.Anns {
 			account.Account2ShardLock.Lock()
@@ -207,6 +254,57 @@ func (bc *BlockChain) AddBlock(block *core.Block) map[string]*big.Int {
 // 		}
 // 	}
 // }
+
+// buildEscrowBlockData 收集 preempt_escrow 在本区块要提交的系统操作。
+// 只在 IsPreemptEscrow() 时调用。
+func (bc *BlockChain) buildEscrowBlockData(height int) *core.EscrowBlockData {
+	d := &core.EscrowBlockData{}
+	self := params.ShardTable[bc.ChainConfig.ShardID]
+
+	// 源分片：为请求 quiesce 的账户生成响应；到达 h_lock+Δ 的记录进入 Expired。
+	seen := make(map[string]bool)
+	for _, req := range bc.EscrowQuiesceReq_pool.Fetch() {
+		rec := account.GetEscrowRecord(req.MigID)
+		if rec == nil || rec.SourceShard != self || seen[req.MigID] {
+			continue
+		}
+		if rec.Status == params.EscrowSettled || rec.Status == params.EscrowExpired {
+			continue
+		}
+		d.Quiesces = append(d.Quiesces, &core.EscrowQuiesce{
+			MigID:  rec.MigID,
+			SStar:  rec.SeqCons,
+			NuStar: rec.NuCons,
+			Status: params.EscrowQuiescing,
+		})
+		seen[rec.MigID] = true
+		account.SetEscrowStatus(rec.MigID, params.EscrowQuiescing)
+	}
+
+	timeout := bc.ChainConfig.MigrationTimeoutBlocks
+	if timeout > 0 {
+		for _, rec := range account.AllEscrowRecords() {
+			if rec.SourceShard != self || seen[rec.MigID] {
+				continue
+			}
+			if (rec.Status == params.EscrowLocked || rec.Status == params.EscrowQuiescing) && height >= rec.HLock+timeout {
+				d.Quiesces = append(d.Quiesces, &core.EscrowQuiesce{
+					MigID:  rec.MigID,
+					SStar:  rec.SeqCons,
+					NuStar: rec.NuCons,
+					Status: params.EscrowExpired,
+				})
+				seen[rec.MigID] = true
+				account.SetEscrowStatus(rec.MigID, params.EscrowExpired)
+			}
+		}
+	}
+
+	d.Batches = bc.Tx_pool.BuildEscrowBatches(height)
+	d.Settles = bc.EscrowSettle_pool.Fetch()
+	d.Debits = bc.EscrowDebit_pool.Fetch()
+	return d
+}
 
 func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 	quota := params.Config.MaxMigSize
@@ -334,6 +432,24 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 		caravans = bc.Tx_pool.FetchCaravans2Pack()
 	}
 
+	// preempt_escrow：构建本块的 batch/quiesce/settle/debit 系统操作。
+	// 必须在 FetchTxs2Pack 之后，因为本块的 payer 交易可能刚进入 MPTP。
+	var escrowData *core.EscrowBlockData
+	if params.Config.IsPreemptEscrow() {
+		escrowData = bc.buildEscrowBlockData(bc.CurrentBlock.Header.Number + 1)
+		for _, b := range escrowData.Batches {
+			if b == nil {
+				continue
+			}
+			m := bc.EscrowBatchArchive[b.MigID]
+			if m == nil {
+				m = make(map[uint64]*core.EscrowBatch)
+				bc.EscrowBatchArchive[b.MigID] = m
+			}
+			m[b.SeqStart] = b
+		}
+	}
+
 	blockHeader := &core.BlockHeader{
 		ParentHash: bc.CurrentBlock.Hash,
 		Number:     bc.CurrentBlock.Header.Number + 1,
@@ -341,15 +457,16 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 	}
 
 	block := core.NewBlock(blockHeader, txs, mig1s, mig2s, anns, nss, borrows, settles, caravans)
+	block.Escrow = escrowData
 
 	//普通交易树
 	block.Header.TxHash = GetTxTreeRoot(txs)
 
 	//迁移交易树
-	block.Header.MigHash = GetMigTreeRoot(mig1s, mig2s, anns, nss, borrows, settles, caravans)
+	block.Header.MigHash = GetMigTreeRootWithEscrow(mig1s, mig2s, anns, nss, borrows, settles, caravans, escrowData)
 
 	//0 代表不更新到磁盘
-	block.Header.StateRoot, _ = bc.getUpdatedTreeOfState(0, blockHeader.Number, txs, mig1s, mig2s, anns, nss, borrows, settles, caravans)
+	block.Header.StateRoot, _ = bc.getUpdatedTreeOfState(0, blockHeader.Number, txs, mig1s, mig2s, anns, nss, borrows, settles, caravans, escrowData)
 
 	block.Hash = block.GetHash()
 
@@ -377,7 +494,7 @@ func (bc *BlockChain) GenerateBlock(id int) *core.Block {
 }
 
 // 输出更新后的状态树 以及 要迁出的账户的余额
-func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.Transaction, mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle, caravans []*core.TXcaravan) ([]byte, map[string]*big.Int) {
+func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.Transaction, mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle, caravans []*core.TXcaravan, escrow *core.EscrowBlockData) ([]byte, map[string]*big.Int) {
 	// build trie from the triedb (in disk)
 	start_execute := time.Now().UnixMicro()
 	st, err := trie.New(trie.TrieID(common.BytesToHash(bc.CurrentBlock.Header.StateRoot)), bc.Triedb)
@@ -448,6 +565,13 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 				sender_state.Balance.Sub(sender_state.Balance, tx.Value)
 				st.Update(tx.Sender, sender_state.Encode())
 			}
+
+			// preempt_escrow：记录每个账户最后执行的 nonce（仅 commit==1 写内存）。
+			if bc.ChainConfig.IsPreemptEscrow() && commit == 1 && !tx.IsRelay && !tx.Relay_Lock {
+				if nu, ok := account.GetTxNonce(tx.Id); ok {
+					account.BumpLastNonce(hex.EncodeToString(tx.Sender), nu)
+				}
+			}
 		}
 
 		r_state_enc := st.Get(tx.Recipient)
@@ -499,6 +623,48 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 				log.Panic()
 			}
 			account_state := account.DecodeAccountState(encoded)
+
+			if bc.ChainConfig.IsPreemptEscrow() {
+				// 迁移准备：把真实余额 n 转入 escrow，源账户余额置 0。
+				// 只有 commit==1 才写内存迁移记录；trie 变更在 commit==0/1 都执行。
+				if account.GetEscrowRecordByAccount(v.Address) != nil {
+					continue
+				}
+				tn := new(big.Int).Set(account_state.Balance)
+				migID := account.EscrowMigID(v.Address, v.FromshardID, v.ToshardID, height, 0)
+				escAddr := account.EscrowAddr(migID)
+				escState := &account.AccountState{Balance: tn, Migrate: -1, Location: selfShardID}
+				st.Update(escAddr, escState.Encode())
+
+				account_state.Balance = big.NewInt(0)
+				account_state.Migrate = v.ToshardID
+				st.Update(hex_address, account_state.Encode())
+				outbalance[v.Address] = big.NewInt(0)
+
+				if commit == 1 {
+					rec := &account.EscrowRecord{
+						MigID:       migID,
+						Account:     v.Address,
+						SourceShard: v.FromshardID,
+						DestShard:   v.ToshardID,
+						Credit:      new(big.Int).Set(tn),
+						SeqCons:     0,
+						TotalCons:   big.NewInt(0),
+						Nu0:         account.GetLastNonce(v.Address),
+						NuCons:      account.GetLastNonce(v.Address),
+						HLock:       height,
+						Status:      params.EscrowLocked,
+						SOwn:        v.FromshardID,
+						Spent:       big.NewInt(0),
+					}
+					account.PutEscrowRecord(rec)
+					// 上一轮 flow 遗留的 gated 交易纳入本轮 MPTP，避免孤立的 nonce 队列。
+					bc.Tx_pool.MergeGatedToMPTP(rec.Account, rec.Nu0)
+					account.SetFlowActive(rec.Account, false)
+				}
+				continue
+			}
+
 			account_state.Migrate = v.ToshardID
 			outbalance[v.Address] = new(big.Int).Set(account_state.Balance)
 			st.Update(hex_address, account_state.Encode())
@@ -674,6 +840,243 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 		}
 	}
 
+	// preempt_escrow：执行 batch / quiesce / settle / debit。
+	// 注意：trie 变更在 commit==0/1 都执行；内存状态/outbox 只在 commit==1 写。
+	if bc.ChainConfig.IsPreemptEscrow() && escrow != nil {
+		// 1) batch 只更新源分片迁移记录的已授权游标，不移动资金。
+		for _, b := range escrow.Batches {
+			if commit != 1 || b == nil {
+				continue
+			}
+			rec := account.GetEscrowRecord(b.MigID)
+			if rec == nil {
+				continue
+			}
+			if b.SeqEnd > rec.SeqCons {
+				rec.SeqCons = b.SeqEnd
+			}
+			if rec.TotalCons == nil {
+				rec.TotalCons = big.NewInt(0)
+			}
+			rec.TotalCons.Add(rec.TotalCons, b.TotalValue)
+			if b.NonceEnd > rec.NuCons {
+				rec.NuCons = b.NonceEnd
+			}
+		}
+
+		// 2) settle：源分片从 escrow 扣 spent + refund，并生成发往目的分片的 Debit。
+		for _, s := range escrow.Settles {
+			if s == nil || s.Spent == nil {
+				continue
+			}
+			rec := account.GetEscrowRecord(s.MigID)
+			if rec == nil || rec.SourceShard != selfShardID {
+				continue
+			}
+			if rec.Status == params.EscrowSettled || rec.Status == params.EscrowExpired {
+				continue
+			}
+			if s.Spent.Sign() < 0 || s.Spent.Cmp(rec.TotalCons) > 0 || s.Spent.Cmp(rec.Credit) > 0 {
+				log.Panicf("preempt_escrow: invalid spent %v for %s (total_cons=%v credit=%v)", s.Spent, s.MigID, rec.TotalCons, rec.Credit)
+			}
+
+			status := params.EscrowSettled
+			owner := rec.DestShard
+			if rec.Status == params.EscrowExpired {
+				status = params.EscrowExpired
+				owner = rec.SourceShard
+			}
+			refund := new(big.Int).Sub(rec.Credit, s.Spent)
+
+			escAddr := account.EscrowAddr(rec.MigID)
+			escEnc := st.Get(escAddr)
+			if escEnc == nil {
+				log.Panicf("preempt_escrow: missing escrow account for %s", rec.MigID)
+			}
+			escState := account.DecodeAccountState(escEnc)
+			escState.Balance.Sub(escState.Balance, s.Spent)
+			escState.Balance.Sub(escState.Balance, refund)
+			if commit == 1 && escState.Balance.Sign() != 0 {
+				fmt.Printf("[escrow][invariant] escrow residual mig=%s balance=%v\n", rec.MigID, escState.Balance)
+			}
+			st.Update(escAddr, escState.Encode())
+
+			aAddr, _ := hex.DecodeString(rec.Account)
+			aEnc := st.Get(aAddr)
+			if aEnc == nil {
+				log.Panicf("preempt_escrow: missing source account %s", rec.Account)
+			}
+			aState := account.DecodeAccountState(aEnc)
+			flow := new(big.Int).Set(aState.Balance)
+
+			debit := &core.EscrowDebit{
+				MigID:  rec.MigID,
+				Spent:  new(big.Int).Set(s.Spent),
+				Refund: new(big.Int).Set(refund),
+				Flow:   new(big.Int).Set(flow),
+				Nu0:    rec.Nu0,
+				NuDst:  s.NuDst,
+				Status: status,
+				SStar:  s.SStar,
+				SM:     s.SM,
+			}
+
+			if status == params.EscrowSettled {
+				aState.Balance = big.NewInt(0)
+				aState.Migrate = -1
+				aState.Location = owner
+				if commit == 1 {
+					rec.NuDst = s.NuDst
+					rec.SOwn = owner
+					rec.Status = status
+					rec.Spent = new(big.Int).Set(s.Spent)
+					account.SetEscrowStatus(rec.MigID, status)
+					account.SetLastNonce(rec.Account, maxU64(rec.Nu0, s.NuDst))
+					account.DeleteEscrowLock(rec.Account)
+					account.SetFlowActive(rec.Account, false)
+					debit.Remaining = bc.escrowRemainingTxs(rec, s.SM)
+
+					account.Account2ShardLock.Lock()
+					account.Account2Shard[rec.Account] = owner
+					delete(account.AccountInOwnShard, rec.Account)
+					account.Account2ShardLock.Unlock()
+
+					bc.EscrowOutDebits = append(bc.EscrowOutDebits, debit)
+					bc.EscrowOutActivations = append(bc.EscrowOutActivations, &core.EscrowActivate{
+						MigID: rec.MigID, Address: rec.Account, SourceShard: rec.SourceShard, DestShard: rec.DestShard, NuStart: maxU64(rec.Nu0, s.NuDst),
+					})
+					account.MarkTerminal(rec.MigID)
+				}
+			} else {
+				// Expired：A 留在源分片，退款回 A；未授权交易回到 flow gate。
+				aState.Balance.Add(aState.Balance, refund)
+				aState.Migrate = -1
+				aState.Location = owner
+				debit.Refund = big.NewInt(0)
+				debit.Flow = big.NewInt(0)
+				debit.Status = params.EscrowExpired
+				if commit == 1 {
+					rec.NuDst = s.NuDst
+					rec.SOwn = owner
+					rec.Status = status
+					rec.Spent = new(big.Int).Set(s.Spent)
+					account.SetEscrowStatus(rec.MigID, status)
+					account.SetLastNonce(rec.Account, maxU64(rec.Nu0, s.NuDst))
+					account.DeleteEscrowLock(rec.Account)
+					account.SetFlowActive(rec.Account, true)
+					rem := bc.escrowRemainingTxs(rec, s.SM)
+					bc.Tx_pool.AddGatedTxs(rec.Account, rem)
+					account.Account2ShardLock.Lock()
+					account.Account2Shard[rec.Account] = owner
+					account.AccountInOwnShard[rec.Account] = true
+					account.Account2ShardLock.Unlock()
+					bc.EscrowOutDebits = append(bc.EscrowOutDebits, debit)
+					account.MarkTerminal(rec.MigID)
+				}
+			}
+			st.Update(aAddr, aState.Encode())
+		}
+
+		// 3) debit：目的分片接收 spent，激活/删除 A，交付 pending。
+		for _, d := range escrow.Debits {
+			if d == nil || d.Spent == nil {
+				continue
+			}
+			p := account.GetPendingRecord(d.MigID)
+			if p == nil || p.DestShard != selfShardID || p.Delivered {
+				continue
+			}
+
+			settleAddr := account.SettlementAddr(d.MigID)
+			settleEnc := st.Get(settleAddr)
+			var settleState *account.AccountState
+			if settleEnc == nil {
+				settleState = &account.AccountState{Balance: big.NewInt(0), Migrate: -1, Location: selfShardID}
+			} else {
+				settleState = account.DecodeAccountState(settleEnc)
+			}
+			settleState.Balance.Add(settleState.Balance, d.Spent)
+
+			aAddr, _ := hex.DecodeString(p.Account)
+			if d.Status == params.EscrowSettled {
+				aEnc := st.Get(aAddr)
+				var aState *account.AccountState
+				if aEnc == nil {
+					aState = &account.AccountState{Balance: big.NewInt(0), Migrate: -1, Location: selfShardID}
+				} else {
+					aState = account.DecodeAccountState(aEnc)
+				}
+				if d.Refund != nil {
+					aState.Balance.Add(aState.Balance, d.Refund)
+				}
+				if d.Flow != nil {
+					aState.Balance.Add(aState.Balance, d.Flow)
+				}
+				aState.Migrate = -1
+				aState.Location = selfShardID
+				st.Update(aAddr, aState.Encode())
+
+				if commit == 1 {
+					account.Account2ShardLock.Lock()
+					account.Account2Shard[p.Account] = selfShardID
+					account.AccountInOwnShard[p.Account] = true
+					account.Account2ShardLock.Unlock()
+					account.SetLastNonce(p.Account, maxU64(d.Nu0, d.NuDst))
+					account.SetFlowActive(p.Account, true)
+					for _, e := range d.Remaining {
+						if e != nil && e.Tx != nil {
+							account.SetTxNonce(e.Tx.Id, e.Nonce)
+						}
+					}
+					bc.Tx_pool.AddGatedTxs(p.Account, d.Remaining)
+				}
+			} else {
+				// Expired：目的分片的 prepared 副本必须撤销。
+				if st.Get(aAddr) != nil {
+					st.Delete(aAddr)
+				}
+			}
+
+			var pending map[string]*big.Int
+			if commit == 1 {
+				pending = account.TakePending(d.MigID)
+			} else {
+				pending = account.SnapshotPending(d.MigID)
+			}
+			for recipientHex, value := range pending {
+				if value == nil || value.Sign() == 0 {
+					continue
+				}
+				rAddr, _ := hex.DecodeString(recipientHex)
+				rEnc := st.Get(rAddr)
+				if rEnc != nil {
+					rState := account.DecodeAccountState(rEnc)
+					if rState.Location == selfShardID {
+						rState.Balance.Add(rState.Balance, value)
+						st.Update(rAddr, rState.Encode())
+						settleState.Balance.Sub(settleState.Balance, value)
+						continue
+					}
+				}
+				if commit == 1 {
+					bc.EscrowOutDeliveries = append(bc.EscrowOutDeliveries, &core.EscrowDelivery{
+						MigID: d.MigID, Recipient: rAddr, Value: new(big.Int).Set(value), IdemKey: d.MigID + ":" + recipientHex,
+					})
+				}
+				settleState.Balance.Sub(settleState.Balance, value)
+			}
+			st.Update(settleAddr, settleState.Encode())
+
+			if commit == 1 {
+				if settleState.Balance.Sign() != 0 {
+					fmt.Printf("[escrow][invariant] settlement residual mig=%s balance=%v\n", d.MigID, settleState.Balance)
+				}
+				account.FinalizePending(d.MigID, d.Status == params.EscrowExpired)
+				account.MarkTerminal(d.MigID)
+			}
+		}
+	}
+
 	st_hash_bytes := st.Hash().Bytes()
 	//只是生成区块
 	if commit == 0 {
@@ -788,7 +1191,13 @@ func (bc *BlockChain) genesisStateTree(stateroot []byte) []byte {
 		// 	continue
 		// }
 		value := new(big.Int)
-		value, ok := value.SetString(params.Init_balance, 10)
+		var ok bool
+		if bc.ChainConfig.IsPreemptEscrow() && bc.ChainConfig.EscrowInitBalance != nil {
+			value.Set(bc.ChainConfig.EscrowInitBalance)
+			ok = true
+		} else {
+			value, ok = value.SetString(params.Init_balance, 10)
+		}
 		if !ok {
 			log.Panic()
 		}
@@ -838,6 +1247,10 @@ func GetTxTreeRoot(txs []*core.Transaction) []byte {
 
 // Get the transaction root, this root can be used to check the transactions
 func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle, caravans []*core.TXcaravan) []byte {
+	return GetMigTreeRootWithEscrow(mig1s, mig2s, anns, nss, borrows, settles, caravans, nil)
+}
+
+func GetMigTreeRootWithEscrow(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXann, nss []*core.TXns, borrows []*core.TXborrow, settles []*core.TXsettle, caravans []*core.TXcaravan, escrow *core.EscrowBlockData) []byte {
 	// use a memory trie database to do this, instead of disk database
 	triedb := trie.NewDatabase(rawdb.NewMemoryDatabase())
 	transactionTree := trie.NewEmpty(triedb)
@@ -862,6 +1275,20 @@ func GetMigTreeRoot(mig1s []*core.TXmig1, mig2s []*core.TXmig2, anns []*core.TXa
 	for _, tx := range caravans {
 		transactionTree.Update(tx.Hash(), tx.Encode())
 	}
+	if escrow != nil {
+		for _, b := range escrow.Batches {
+			transactionTree.Update(b.Hash(), b.Encode())
+		}
+		for _, q := range escrow.Quiesces {
+			transactionTree.Update(q.Hash(), q.Encode())
+		}
+		for _, s := range escrow.Settles {
+			transactionTree.Update(s.Hash(), s.Encode())
+		}
+		for _, d := range escrow.Debits {
+			transactionTree.Update(d.Hash(), d.Encode())
+		}
+	}
 	return transactionTree.Hash().Bytes()
 }
 
@@ -869,4 +1296,28 @@ func (bc *BlockChain) IsBlockValid(block *core.Block) bool {
 	// todo
 
 	return true
+}
+
+func maxU64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// escrowRemainingTxs 返回该迁移中尚未被目的分片记录的原始交易：
+// MPTP 中未授权的 + 已授权但 seq > SM（未记录）的批次。
+// 这些交易保留原 nonce，可用于退款后重放。
+func (bc *BlockChain) escrowRemainingTxs(rec *account.EscrowRecord, sm uint64) []*core.EscrowTx {
+	out := bc.Tx_pool.TakeMPTP(rec.Account)
+	if m := bc.EscrowBatchArchive[rec.MigID]; m != nil {
+		for seq, b := range m {
+			if b != nil && seq > sm {
+				out = append(out, b.Txs...)
+			}
+		}
+		delete(bc.EscrowBatchArchive, rec.MigID)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Nonce < out[j].Nonce })
+	return out
 }

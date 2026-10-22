@@ -17,6 +17,8 @@ type TXmig2 struct {
 	H       int
 	Address string   `json:"address"`
 	Value   *big.Int `json:"value"`
+	// preempt_escrow 专用：迁移实例 ID；旧 schema 为空。
+	MigID string
 }
 
 // Encode transaction for storing

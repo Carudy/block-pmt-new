@@ -77,6 +77,25 @@ type TxFromClient struct {
 	Txs []*core.Transaction
 }
 
+// preempt_escrow：客户端发送带 nonce 的交易。
+type EscrowTxsFromClient struct {
+	Txs []*core.EscrowTx
+}
+
+type EscrowTerm struct {
+	ShardID string
+	Epoch   int
+}
+
+type EscrowStart struct {
+	Epoch int
+}
+
+type EscrowBusy struct {
+	ShardID string
+	Epoch   int
+}
+
 type Mig2 struct {
 	TXmig2s []*core.TXmig2
 	ShardID string
@@ -172,6 +191,19 @@ const (
 	cBalanceAndPending command = "balance&TX"
 	cSure              command = "sure"
 	cSettle            command = "settle"
+
+	// preempt_escrow 专用命令（必须 <= 12 字节）
+	cEscrowClient  command = "escrowClient"
+	cEscrowBatch   command = "escrowBatch"
+	cEscrowQReq    command = "escrowQReq"
+	cEscrowQuies   command = "escrowQuies"
+	cEscrowSettle  command = "escrowSettle"
+	cEscrowDebit   command = "escrowDebit"
+	cEscrowActive  command = "escrowActive"
+	cEscrowDeliver command = "escrowDeliv"
+	cEscrowTerm    command = "escrowTerm"
+	cEscrowStart   command = "escrowStart"
+	cEscrowBusy    command = "escrowBusy"
 )
 
 // 默认前十二位为命令名称

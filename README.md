@@ -29,3 +29,14 @@ However, you can write some code to enable batch running yourself.
 # Additional Information
 **Earlier version**: This work is built on an earlier version of **BlockEmulator**, so the code structure does not match the current `main` branch.  
 **Omitted some security implementations**: Some features related to security or validation, such as Merkle proof and validation, are not implemented in this code. These features are discussed in other papers and are not central to this work.
+
+# preempt_escrow (new prototype)
+
+This branch also contains an isolated `preempt_escrow` schema:
+
+```bash
+./set_config.sh --schema preempt-escrow
+SCHEMA=preempt_escrow ./run.sh
+```
+
+It keeps `lb` / `ftl` / `caravan` / `preempt` unchanged and adds escrow, nonce-prefix authorization, pending credit, settle/refund, and flow gating. See `plan_preempt_escrow.md` for design, status, and current limitations (signatures/proofs/multi-validator are deferred).
