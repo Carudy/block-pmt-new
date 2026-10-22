@@ -500,9 +500,17 @@ Known Gate-1 baseline (ns4 / is1000 / mcb25 / nn16, full `20W.csv`):
 | schema | injected | committed | delegated | dropped | unexplained |
 |---|---|---|---|---|---|
 | `ftl` (control) | 199,085 | 198,092 | 0 | 553 | 440 |
-| `preempt_escrow` (after the handoff fixes) | 199,085 | 175,042 | 19,261 | 1,100 relay | 3,682 |
+| `preempt_escrow` (after the handoff fixes) | 199,085 | 170,649 | 19,979 | 5,862 relay | 2,595 |
 
-Before the `TakeQueuedFor` sweep the escrow run dropped 6,923 txs at the own-shard filter; after it, sender-side drops are 0. The remaining ~1.8 % is unexplained and is believed to be message loss on the injection/batch/settle channels (`utils.TcpDial` has no ack/retry).
+Progression on the escrow side (same config each time):
+
+| build | committed | dropped_not_own | dropped_relay | unexplained |
+|---|---|---|---|---|
+| before the handoff fixes | 168,188 | 6,923 | 0 | 3,410 |
+| + `TakeQueuedFor` sweep | 170,734 | 5,246 | 0 | 2,576 |
+| + intake routing (`InLocalEscrowFlow` in `handleEscrowTxsFromClient`) | 170,649 | **0** | 5,862 | 2,595 |
+
+The sweep removed the sender-side drops; the intake-routing fix stopped txs bouncing between source and destination during the settle→debit window (forwarded_out dropped from 29,860 to 82). What remains is relay delivery: `handleRelay` routes by `Addr2Shard` (static), so payments to migrated recipients land on the wrong shard and are dropped (`dropped_relay`), and unacked relay/delivery messages account for the rest. Both need a decision because the routing change also affects the old schemas.
 
 ### 9.5 What not to run casually
 

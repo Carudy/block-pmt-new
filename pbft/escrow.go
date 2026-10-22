@@ -74,7 +74,10 @@ func (p *Pbft) handleEscrowTxsFromClient(content []byte) {
 		if !ok {
 			sid = account.Addr2Shard(from)
 		}
-		if sid == self {
+		// 注意：目的分片在 Debit 之前还没把 A 的 Account2Shard 改成自己，
+		// 若只按 Account2Shard 判定，交易会在源/目的分片之间来回转发（每次一跳都有丢包风险）。
+		// InLocalEscrowFlow 为 true 说明本分片已用 escrow 状态跟踪该账户，直接本地入队。
+		if sid == self || account.InLocalEscrowFlow(from) {
 			e.Tx.TxHash = e.Tx.Hash()
 			local = append(local, e.Tx)
 		} else {
