@@ -83,11 +83,17 @@ func (p *Pbft) handleEscrowGapReq(content []byte) {
 	if err != nil {
 		return
 	}
-	rec := account.GetPendingRecord(q.MigID)
-	if rec == nil {
+	// 回复给请求方（目的分片）。源分片只有 EscrowRecord，没有 PendingRecord。
+	dest := -1
+	if rec := account.GetEscrowRecord(q.MigID); rec != nil {
+		dest = rec.DestShard
+	} else if pr := account.GetPendingRecord(q.MigID); pr != nil {
+		dest = pr.DestShard
+	}
+	if dest < 0 {
 		return
 	}
-	name := params.ShardTableInt2Str[rec.DestShard]
+	name := params.ShardTableInt2Str[dest]
 	if name == "" {
 		return
 	}
