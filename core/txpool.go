@@ -95,6 +95,8 @@ type Tx_pool struct {
 	EscrowForwardRelay []*Transaction
 	// 已上报过的 nonce gap（addr -> missing nonce），避免每块重复刷日志。
 	EscrowGapSeen map[string]uint64
+	// 待向源分片发起的缺口查询（由 pbft 层消费）。
+	GapNeed []GapNeedEvent
 }
 
 // DropEvent 是一条“交易没有进入区块”的记录。
@@ -107,6 +109,13 @@ type DropEvent struct {
 	Nu0    uint64
 	Reason string
 	Height int
+}
+
+// GapNeedEvent 表示 gated 队列缺了某个 nonce，需要向源分片回查。
+type GapNeedEvent struct {
+	Account string
+	Nonce   uint64
+	Height  int
 }
 
 // IntakeStats 汇总本节点交易池在“进入 → 打包”之间各环节的交易计数。
@@ -237,6 +246,24 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 		senderNotOwn := !account.AccountInOwnShard[from] && !v.IsRelay && !v.Relay_Lock
 		relayTargetNotOwn := !account.AccountInOwnShard[to] && (v.IsRelay || v.Relay_Lock)
 		account.Account2ShardLock.Unlock()
+		// preempt_escrow 防御：账户已在本分片结算离开，但如果 AccountInOwnShard 因
+		// 交接时序还残留为 true，这里仍会把它当普通交易执行，导致目的分片的 nonce
+		// 序列永久缺一格（实测 S0 在结算 6 个块后又打包了该账户 11 笔交易）。
+		// 以 escrow 记录为准：已 Settled/Expired 且映射已指向别的分片 ⇒ 必须转发，不能执行。
+		if config.IsPreemptEscrow() && !v.IsRelay && !v.Relay_Lock && account.HasSettledEscrowRecord(from) {
+			account.Account2ShardLock.Lock()
+			sid, ok := account.Account2Shard[from]
+			self := params.ShardTable[params.Config.ShardID]
+			account.Account2ShardLock.Unlock()
+			if ok && sid != self {
+				if nu, ok := account.GetTxNonce(v.Id); ok {
+					pool.EscrowForward = append(pool.EscrowForward, &EscrowTx{Tx: v, Nonce: nu})
+					pool.Intake.ForwardedOut++
+					continue
+				}
+			}
+		}
+
 		if senderNotOwn || relayTargetNotOwn {
 			// preempt_escrow：账户已经在本分片结算离开，但交易还滞留在队列里（交接窗口）。
 			// 不丢，交给 pbft 层转发到它当前所在的分片。
@@ -485,6 +512,7 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 					} else {
 						// 严格模式（EscrowGapRepairBlocks=0）：不跳过缺口，只上报一次，等人工定位原因。
 						pool.reportGapLocked(addr, start, blockNumber)
+						pool.GapNeed = append(pool.GapNeed, GapNeedEvent{Account: addr, Nonce: start, Height: blockNumber})
 						break
 					}
 				}
@@ -905,6 +933,25 @@ func (pool *Tx_pool) TakeEscrowForward() []*EscrowTx {
 	}
 	out := pool.EscrowForward
 	pool.EscrowForward = nil
+	return out
+}
+
+// RecordLost 记一笔确认丢失的交易（源分片也找不到）。
+func (pool *Tx_pool) RecordLost(sender string, nonce uint64, height int) {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	pool.recordDropLocked(nil, sender, "lost", nonce, 0, height)
+}
+
+// TakeGapNeeds 取走待回查的缺口。
+func (pool *Tx_pool) TakeGapNeeds() []GapNeedEvent {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	if len(pool.GapNeed) == 0 {
+		return nil
+	}
+	out := pool.GapNeed
+	pool.GapNeed = nil
 	return out
 }
 

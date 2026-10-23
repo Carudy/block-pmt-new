@@ -215,6 +215,8 @@ const (
 	cEscrowClient  command = "escrowClient"
 	cEscrowAck     command = "escrowAck"
 	cEscrowBatch   command = "escrowBatch"
+	cEscrowGapReq  command = "escrowGapReq"
+	cEscrowGapResp command = "escrowGapRes"
 	cEscrowQReq    command = "escrowQReq"
 	cEscrowQuies   command = "escrowQuies"
 	cEscrowSettle  command = "escrowSettle"

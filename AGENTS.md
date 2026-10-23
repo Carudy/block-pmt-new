@@ -523,6 +523,7 @@ Progression on the escrow side (same config each time):
 | + `TakeQueuedFor` sweep | 170,734 | 5,246 | 0 | 2,576 |
 | + intake routing (`InLocalEscrowFlow` in `handleEscrowTxsFromClient`) | 170,649 | **0** | 5,862 | 2,595 |
 | + reliable injection/forwarding/relay + stranded forwarding | ~154,000 | 0 | 0 | **1,400 – 2,800** |
+| + settled-account guard + gap recovery | ~152,000 | 0 | 0 | ~1,800 |
 
 The sweep removed the sender-side drops; the intake-routing fix stopped txs bouncing between source and destination during the settle→debit window (forwarded_out dropped from 29,860 to 82).
 

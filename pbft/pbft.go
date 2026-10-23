@@ -315,6 +315,10 @@ func (p *Pbft) handleRequest(data []byte) {
 		}
 	case cEscrowBatch:
 		go p.handleEscrowBatch(content)
+	case cEscrowGapReq:
+		go p.handleEscrowGapReq(content)
+	case cEscrowGapResp:
+		go p.handleEscrowGapResp(content)
 	case cEscrowQReq:
 		go p.handleEscrowQuiesceReq(content)
 	case cEscrowQuies:

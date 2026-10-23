@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 	"log"
 	"math/big"
+	"sync"
 )
 
 // EscrowTx 是 preempt_escrow 专用的交易包装：保留原始 Transaction，同时携带
@@ -213,6 +214,42 @@ func DecodeEscrowActivate(to_decode []byte) *EscrowActivate {
 		log.Panic(err)
 	}
 	return &a
+}
+
+// ---------- 迁移后重放集归档（缺口恢复用） ----------
+
+var (
+	escrowRemainingLock  sync.Mutex
+	escrowRemainingByMig map[string]map[uint64]*EscrowTx
+)
+
+// ArchiveEscrowRemaining 在结算时保留 Debit.Remaining，供目的分片按 nonce 回查。
+func ArchiveEscrowRemaining(migID string, txs []*EscrowTx) {
+	if len(txs) == 0 {
+		return
+	}
+	escrowRemainingLock.Lock()
+	if escrowRemainingByMig == nil {
+		escrowRemainingByMig = make(map[string]map[uint64]*EscrowTx)
+	}
+	m := make(map[uint64]*EscrowTx, len(txs))
+	for _, e := range txs {
+		if e != nil {
+			m[e.Nonce] = e
+		}
+	}
+	escrowRemainingByMig[migID] = m
+	escrowRemainingLock.Unlock()
+}
+
+// GetEscrowRemaining 按 nonce 取一笔已归档的重放交易。
+func GetEscrowRemaining(migID string, nonce uint64) *EscrowTx {
+	escrowRemainingLock.Lock()
+	defer escrowRemainingLock.Unlock()
+	if m := escrowRemainingByMig[migID]; m != nil {
+		return m[nonce]
+	}
+	return nil
 }
 
 // EscrowDelivery 是目的分片结算完成后，发给远端收款方所在分片的系统交付。

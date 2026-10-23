@@ -436,6 +436,13 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 		}
 	}
 
+	// 缺口回查：目的分片向源分片要缺失的 nonce（源分片保留着 Debit.Remaining）。
+	for _, need := range p.Node.CurChain.Tx_pool.TakeGapNeeds() {
+		if rec := account.GetPendingRecordByAccount(need.Account); rec != nil {
+			p.requestGap(rec.MigID, need.Nonce)
+		}
+	}
+
 	// 记录实验日志（仅 N0 创建了 writer）。
 	// 丢弃事件：strict gap / duplicate / no_nonce / not_own / relay。
 	if evs := p.Node.CurChain.Tx_pool.TakeDropEvents(); len(evs) != 0 {

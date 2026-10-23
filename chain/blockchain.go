@@ -939,6 +939,8 @@ func (bc *BlockChain) getUpdatedTreeOfState(commit int, height int, txs []*core.
 					account.DeleteEscrowLock(rec.Account)
 					account.SetFlowActive(rec.Account, false)
 					debit.Remaining = bc.escrowRemainingTxs(rec, s.SM, true)
+					// 保留重放集：目的分片发现 nonce 缺口时可以按 nonce 回查。
+					core.ArchiveEscrowRemaining(rec.MigID, debit.Remaining)
 
 					account.Account2ShardLock.Lock()
 					account.Account2Shard[rec.Account] = owner
