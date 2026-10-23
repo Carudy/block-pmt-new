@@ -87,6 +87,8 @@ Default `params.Config.Schema` is **`SchemaPreempt`** (old bank version). Experi
 - per-tx lifecycle log `log/S*_escrow_tx.csv` (auth / record / deliver events, joined by txid), `log/S*_escrow_drop.csv` (drop reasons), `escrow_batch`/`escrow_tx` columns on `S*_block.csv` (escrow only).
 - each `EscrowBatch` occupies exactly **1** slot of `MaxBlockSize`; batches are built before `FetchTxs2Pack` so the reservation is exact.
 - `MaxEscrowBatchTxs = 0` (unlimited) and `EscrowGapRepairBlocks = 0` (strict) are the paper defaults. With strict gaps a lost tx **stops** the run instead of being skipped; the missing nonce is logged to `S*_escrow_drop.csv` and stdout.
+- reliable delivery for escrow: client injection and shard→shard forwarding carry a `Seq`, the receiver de-duplicates and acks, and the sender retries every 2.5 s (8 tries); relays do the same via `Relay.Seq` / `RelayAck`. Exhausted retries are logged as `relay_lost` in the drop file so the ledger still closes.
+- `run.sh` accepts `RUN_TIMEOUT_SEC`; `run_exp.sh` sets it per row (`EXP_TIMEOUT`, default 900 s) so one stuck row cannot block a batch. Exit code 2 means “timed out”.
 
 **Not implemented (P5):**
 
@@ -520,8 +522,11 @@ Progression on the escrow side (same config each time):
 | before the handoff fixes | 168,188 | 6,923 | 0 | 3,410 |
 | + `TakeQueuedFor` sweep | 170,734 | 5,246 | 0 | 2,576 |
 | + intake routing (`InLocalEscrowFlow` in `handleEscrowTxsFromClient`) | 170,649 | **0** | 5,862 | 2,595 |
+| + reliable injection/forwarding/relay + stranded forwarding | ~154,000 | 0 | 0 | **1,400 – 2,800** |
 
-The sweep removed the sender-side drops; the intake-routing fix stopped txs bouncing between source and destination during the settle→debit window (forwarded_out dropped from 29,860 to 82). What remains is relay delivery: `handleRelay` routes by `Addr2Shard` (static), so payments to migrated recipients land on the wrong shard and are dropped (`dropped_relay`), and unacked relay/delivery messages account for the rest. Both need a decision because the routing change also affects the old schemas.
+The sweep removed the sender-side drops; the intake-routing fix stopped txs bouncing between source and destination during the settle→debit window (forwarded_out dropped from 29,860 to 82).
+
+**Current blocker:** with strict gaps the residual ~1 % shows up as a nonce gap right after the migration window (h36–40 on ns4) and the run stalls until `RUN_TIMEOUT_SEC`. Every run completes or aborts cleanly, and the ledger closes to ~99 %, but it is not yet a zero-loss pipeline. The remaining suspect is the settle→debit handoff for relays that were already queued on the source (traced example: txid `194907`, nonce 76, `not_own` at h35). Do not start the paper batch until this is 0 or the lab accepts the loss.
 
 ### 9.5 What not to run casually
 

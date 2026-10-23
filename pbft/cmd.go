@@ -71,6 +71,13 @@ type Reply struct {
 type Relay struct {
 	Txs     []*core.TXrelay
 	ShardID string
+	// Seq 用于可靠投递：接收方按 (ShardID, Seq) 去重并回 RelayAck。
+	Seq uint64
+}
+
+// RelayAck 是 relay 接收方对一批 relay 的确认。
+type RelayAck struct {
+	Seq uint64
 }
 
 type TxFromClient struct {
@@ -83,6 +90,8 @@ type TxFromClient struct {
 type EscrowTxsFromClient struct {
 	Seq uint64
 	Txs []*core.EscrowTx
+	// AckAddr 非空时表示这是分片间转发，确认发给该地址（转发方），而不是客户端。
+	AckAddr string
 }
 
 // EscrowClientAck 是分片对一次注入的确认。
@@ -182,6 +191,7 @@ const (
 
 	cClient   command = "client"
 	cRelay    command = "relay"
+	cRelayAck command = "relayAck"
 	cTXmig1   command = "txmig1"
 	cAnnounce command = "announce"
 	cCaP      command = "csAps"

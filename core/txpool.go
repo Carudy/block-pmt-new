@@ -91,6 +91,8 @@ type Tx_pool struct {
 	DropEvents []DropEvent
 	// 已结算离开本分片、但交易还滞留在队列里待转发的交易（交接瞬间的窄窗口）。
 	EscrowForward []*EscrowTx
+	// 收款方已不在本分片的 relay：转发到它当前所在分片（发端已做可靠投递）。
+	EscrowForwardRelay []*Transaction
 	// 已上报过的 nonce gap（addr -> missing nonce），避免每块重复刷日志。
 	EscrowGapSeen map[string]uint64
 }
@@ -241,6 +243,19 @@ func (pool *Tx_pool) FetchTxs2Pack(left_count, blockNumber int) (txs []*Transact
 			if config.IsPreemptEscrow() && senderNotOwn && !relayTargetNotOwn && account.HasSettledEscrowRecord(from) {
 				if nu, ok := account.GetTxNonce(v.Id); ok {
 					pool.EscrowForward = append(pool.EscrowForward, &EscrowTx{Tx: v, Nonce: nu})
+					pool.Intake.ForwardedOut++
+					continue
+				}
+			}
+			// preempt_escrow：relay 的收款方已经不在本分片。不丢，交给 pbft 层按当前
+			// 映射转发（relay 发送侧已带 ack/重传，转发不会沉默丢失）。
+			if config.IsPreemptEscrow() && relayTargetNotOwn && !account.InLocalEscrowFlow(to) {
+				account.Account2ShardLock.Lock()
+				sid, ok := account.Account2Shard[to]
+				self := params.ShardTable[params.Config.ShardID]
+				account.Account2ShardLock.Unlock()
+				if ok && sid != self {
+					pool.EscrowForwardRelay = append(pool.EscrowForwardRelay, v)
 					pool.Intake.ForwardedOut++
 					continue
 				}
@@ -869,6 +884,18 @@ func (pool *Tx_pool) reportGapLocked(addr string, missing uint64, height int) {
 	})
 }
 
+// TakeEscrowForwardRelay 取走需要转发的 relay 交易。
+func (pool *Tx_pool) TakeEscrowForwardRelay() []*Transaction {
+	pool.Lock.Lock()
+	defer pool.Lock.Unlock()
+	if len(pool.EscrowForwardRelay) == 0 {
+		return nil
+	}
+	out := pool.EscrowForwardRelay
+	pool.EscrowForwardRelay = nil
+	return out
+}
+
 // TakeEscrowForward 取走交接窗口里需要转发的交易。
 func (pool *Tx_pool) TakeEscrowForward() []*EscrowTx {
 	pool.Lock.Lock()
@@ -935,6 +962,34 @@ func (pool *Tx_pool) QueueDump() []QueueDumpEntry {
 				continue
 			}
 			out = append(out, QueueDumpEntry{Pool: "gated", TxID: e.Tx.Id, Sender: addr, Nonce: int64(e.Nonce)})
+		}
+	}
+	for _, e := range pool.EscrowForward {
+		if e == nil || e.Tx == nil {
+			continue
+		}
+		out = append(out, QueueDumpEntry{Pool: "forward", TxID: e.Tx.Id, Sender: hex.EncodeToString(e.Tx.Sender), Nonce: int64(e.Nonce)})
+	}
+	for _, tx := range pool.EscrowForwardRelay {
+		if tx == nil {
+			continue
+		}
+		out = append(out, QueueDumpEntry{Pool: "forward_relay", TxID: tx.Id, Sender: hex.EncodeToString(tx.Sender), Nonce: -1})
+	}
+	for _, list := range pool.Relay_Pools {
+		for _, tx := range list {
+			if tx == nil {
+				continue
+			}
+			out = append(out, QueueDumpEntry{Pool: "relay_pool", TxID: tx.Id, Sender: hex.EncodeToString(tx.Sender), Nonce: -1})
+		}
+	}
+	for addr, list := range pool.Locking_TX_Pools {
+		for _, tx := range list {
+			if tx == nil {
+				continue
+			}
+			out = append(out, QueueDumpEntry{Pool: "locked", TxID: tx.Id, Sender: addr, Nonce: -1})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

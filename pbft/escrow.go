@@ -71,7 +71,7 @@ func (p *Pbft) handleEscrowTxsFromClient(content []byte) {
 		}
 		if escrowInjectSeen[msg.Seq] {
 			escrowInjectSeenLock.Unlock()
-			sendEscrowAck(msg.Seq) // 重传：已经处理过，直接再确认一次
+			sendEscrowAck(msg.Seq, msg.AckAddr) // 重传：已经处理过，直接再确认一次
 			return
 		}
 		escrowInjectSeen[msg.Seq] = true
@@ -121,17 +121,25 @@ func (p *Pbft) handleEscrowTxsFromClient(content []byte) {
 
 	// 入池之后才确认，保证客户端停止重传时交易确实已经在本分片。
 	if msg.Seq != 0 {
-		sendEscrowAck(msg.Seq)
+		sendEscrowAck(msg.Seq, msg.AckAddr)
 	}
 }
 
-// sendEscrowAck 告诉客户端某条注入消息已被本分片处理。
-func sendEscrowAck(seq uint64) {
+// sendEscrowAck 确认一条注入/转发消息。ackAddr 为空时发给客户端（客户端注入），
+// 否则发给转发方分片。
+func sendEscrowAck(seq uint64, ackAddr string) {
+	if seq == 0 {
+		return
+	}
 	b, err := json.Marshal(EscrowClientAck{ShardID: params.ShardTable[params.Config.ShardID], Seq: seq})
 	if err != nil {
 		return
 	}
-	utils.TcpDial(jointMessage(cEscrowAck, b), params.ClientAddr)
+	target := params.ClientAddr
+	if ackAddr != "" {
+		target = ackAddr
+	}
+	utils.TcpDial(jointMessage(cEscrowAck, b), target)
 }
 
 func (p *Pbft) sendEscrowClientTxs(shardID int, txs []*core.EscrowTx) {
@@ -143,8 +151,20 @@ func (p *Pbft) sendEscrowClientTxs(shardID int, txs []*core.EscrowTx) {
 	if addr == "" {
 		return
 	}
-	b, _ := json.Marshal(EscrowTxsFromClient{Txs: txs})
-	utils.TcpDial(jointMessage(cEscrowClient, b), addr)
+	// 转发也走可靠投递：丢一条转发消息就等于丢一批用户交易。
+	seq := nextReliableSeq()
+	self := params.NodeTable[params.Config.ShardID]["N0"]
+	b, err := json.Marshal(EscrowTxsFromClient{Seq: seq, Txs: txs, AckAddr: self})
+	if err != nil {
+		return
+	}
+	ids := make([]int, 0, len(txs))
+	for _, e := range txs {
+		if e != nil && e.Tx != nil {
+			ids = append(ids, e.Tx.Id)
+		}
+	}
+	registerReliable(seq, cEscrowClient, b, addr, "fwd", ids)
 }
 
 func (p *Pbft) handleEscrowBatch(content []byte) {
@@ -404,6 +424,18 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 		}
 	}
 
+	// 可靠投递重试耗尽：这些 relay 里的交易算作丢弃（relay_lost），账本仍然闭合。
+	if lost := TakeReliableLost(); len(lost) != 0 {
+		for _, id := range lost {
+			if escrowdroplog != nil {
+				escrowdroplog.Write([]string{fmt.Sprintf("%d", id), "", "0", "0", "relay_lost", fmt.Sprintf("%d", height)})
+			}
+		}
+		if escrowdroplog != nil {
+			escrowdroplog.Flush()
+		}
+	}
+
 	// 记录实验日志（仅 N0 创建了 writer）。
 	// 丢弃事件：strict gap / duplicate / no_nonce / not_own / relay。
 	if evs := p.Node.CurChain.Tx_pool.TakeDropEvents(); len(evs) != 0 {
@@ -443,6 +475,19 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 		}
 		for sid, txs := range byShard {
 			p.sendEscrowClientTxs(sid, txs)
+		}
+	}
+
+	// 收款方已迁走的 relay：按当前映射重新发送（借助 TryRelay2 的可靠投递）。
+	if stranded := p.Node.CurChain.Tx_pool.TakeEscrowForwardRelay(); len(stranded) != 0 {
+		wrapped := make([]*core.TXrelay, 0, len(stranded))
+		for _, tx := range stranded {
+			if tx != nil {
+				wrapped = append(wrapped, &core.TXrelay{Txcs: tx})
+			}
+		}
+		if len(wrapped) != 0 {
+			p.TryRelay2(wrapped)
 		}
 	}
 
@@ -536,7 +581,7 @@ func (p *Pbft) escrowAfterCommit(block *core.Block) {
 
 	// 所有 shard（包括空闲 shard）在收到 escrowStart 后都可上报 terminal。
 	escrowStateLock.Lock()
-	busy := escrowStarted && (!account.AllEscrowTerminal() || mptp != 0 || gated != 0 || normal != 0)
+	busy := escrowStarted && (!account.AllEscrowTerminal() || mptp != 0 || gated != 0 || normal != 0 || reliablePendingCount() != 0)
 	if busy {
 		escrowTermSent = false
 	}

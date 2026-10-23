@@ -139,9 +139,12 @@ while ! grep -q "停止时间" "$client_log" 2>/dev/null; do
         echo "client 进程已退出（未检测到 '停止时间'，可能异常结束）。"
         break
     fi
-    if [ "$run_timeout" -gt 0 ] && [ $(( $(date +%s) - run_started )) -ge "$run_timeout" ]; then
+	    if [ "$run_timeout" -gt 0 ] && [ $(( $(date +%s) - run_started )) -ge "$run_timeout" ]; then
         echo "!! 超过 RUN_TIMEOUT_SEC=${run_timeout}s 仍未结束，终止本次运行。" >&2
         ./kill_block_exe.sh
+        if [ "${NO_PACK:-0}" != "1" ]; then
+            N_SHARD="$num_shards" N_NODES="$num_nodes" ./zip_res.sh
+        fi
         exit 2
     fi
     sleep 5

@@ -41,7 +41,9 @@ on_interrupt() {
 trap cleanup_nodes EXIT
 trap on_interrupt INT TERM
 
-# ---------------- 解析表头：得到各列索引（0-based；未出现的列 = -1） ----------------
+# 每个实验的最大运行秒数（默认 30 分钟）；超时则终止本行并继续下一行。
+# 严格 nonce 模式下出现缺口时，run.sh 会卡住不结束，这个超时就是保险丝。
+row_timeout="${EXP_TIMEOUT:-900}"
 header_norm=$(head -n 1 "$csv" | tr '\t' ',')
 idx_scheme=-1; idx_shards=-1; idx_inject=-1; idx_nodes=-1; idx_mcb=-1; idx_mbs=-1
 
@@ -131,19 +133,22 @@ while IFS= read -r rawline || [ -n "$rawline" ]; do
         fail=$((fail + 1)); continue
     fi
 
-    # run.sh 读取环境变量 SCHEMA / NUM_SHARDS / NUM_NODES
-    if [ -n "$nodes" ]; then
-        SCHEMA="$scheme" NUM_SHARDS="$shards" NUM_NODES="$nodes" ./run.sh
-    else
-        SCHEMA="$scheme" NUM_SHARDS="$shards" ./run.sh
-    fi
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        ok=$((ok + 1))
-    else
-        echo "!! run.sh 返回非零状态：$rc" >&2
-        fail=$((fail + 1))
-    fi
+    	# run.sh 读取环境变量 SCHEMA / NUM_SHARDS / NUM_NODES
+    	if [ -n "$nodes" ]; then
+    		SCHEMA="$scheme" NUM_SHARDS="$shards" NUM_NODES="$nodes" RUN_TIMEOUT_SEC="$row_timeout" ./run.sh
+    	else
+    		SCHEMA="$scheme" NUM_SHARDS="$shards" RUN_TIMEOUT_SEC="$row_timeout" ./run.sh
+    	fi
+    	rc=$?
+    	if [ "$rc" -eq 0 ]; then
+    		ok=$((ok + 1))
+    	elif [ "$rc" -eq 2 ]; then
+    		echo "!! 本行超时（EXP_TIMEOUT=${row_timeout}s）提前终止，继续下一行：scheme=$scheme shards=$shards inject=$inject" >&2
+    		fail=$((fail + 1))
+    	else
+    		echo "!! run.sh 返回非零状态：$rc" >&2
+    		fail=$((fail + 1))
+    	fi
 done < "$csv"
 
 echo ""

@@ -283,6 +283,11 @@ func (p *Pbft) handleRequest(data []byte) {
 		go p.handleTxFromClient(content)
 	case cRelay:
 		go p.handleRelay(content)
+	case cRelayAck:
+		var a RelayAck
+		if err := json.Unmarshal(content, &a); err == nil {
+			ackReliable(a.Seq)
+		}
 	case cNewMap:
 		go p.handleNewMap(content)
 	case cTXmig1:
@@ -303,6 +308,11 @@ func (p *Pbft) handleRequest(data []byte) {
 		go p.handleSettle(content)
 	case cEscrowClient:
 		go p.handleEscrowTxsFromClient(content)
+	case cEscrowAck:
+		var a EscrowClientAck
+		if err := json.Unmarshal(content, &a); err == nil {
+			ackReliable(a.Seq)
+		}
 	case cEscrowBatch:
 		go p.handleEscrowBatch(content)
 	case cEscrowQReq:
@@ -1153,6 +1163,23 @@ func (p *Pbft) TryRelay(relaytxs, alltxs []*core.Transaction, st *trie.Trie, num
 		txs := relaypool[params.ShardTable[k]]
 		if len(txs) != 0 {
 			target_leader := v["N0"]
+			if params.Config.IsPreemptEscrow() {
+				// 可靠投递：Seq + ack/重传，避免整批 relay 丢失后收款方永远收不到钱。
+				seq := nextReliableSeq()
+				r := Relay{Txs: txs, ShardID: config.ShardID, Seq: seq}
+				bc, err := json.Marshal(r)
+				if err != nil {
+					log.Panic(err)
+				}
+				ids := make([]int, 0, len(txs))
+				for _, t := range txs {
+					if t != nil && t.Txcs != nil {
+						ids = append(ids, t.Txcs.Id)
+					}
+				}
+				registerReliable(seq, cRelay, bc, target_leader, "relay", ids)
+				continue
+			}
 			r := Relay{
 				Txs:     txs,
 				ShardID: config.ShardID,
@@ -1186,6 +1213,22 @@ func (p *Pbft) TryRelay2(relaytxs []*core.TXrelay) {
 		txs := relaypool[params.ShardTable[k]]
 		if len(txs) != 0 {
 			target_leader := v["N0"]
+			if params.Config.IsPreemptEscrow() {
+				seq := nextReliableSeq()
+				r := Relay{Txs: txs, ShardID: config.ShardID, Seq: seq}
+				bc, err := json.Marshal(r)
+				if err != nil {
+					log.Panic(err)
+				}
+				ids := make([]int, 0, len(txs))
+				for _, t := range txs {
+					if t != nil && t.Txcs != nil {
+						ids = append(ids, t.Txcs.Id)
+					}
+				}
+				registerReliable(seq, cRelay, bc, target_leader, "relay2", ids)
+				continue
+			}
 			r := Relay{
 				Txs:     txs,
 				ShardID: config.ShardID,
@@ -1347,6 +1390,16 @@ func (p *Pbft) handleRelay(content []byte) {
 	}
 	// fmt.Printf("\n本节点已接收到分片%v发来的relay交易，数量为：%v \n\n", relay.ShardID, len(relay.Txs))
 	//如果接收者不属于本分片了，则发给目标分片
+	// 可靠投递：重传的 relay 只处理一次，处理完回 ack（仅 preempt_escrow 会带 Seq）。
+	if relay.Seq != 0 {
+		key := fmt.Sprintf("%s:%d", relay.ShardID, relay.Seq)
+		if seenReliable(key) {
+			sendRelayAck(relay.ShardID, relay.Seq)
+			return
+		}
+		defer sendRelayAck(relay.ShardID, relay.Seq)
+	}
+
 	self_shardID := params.ShardTable[params.Config.ShardID]
 	relaytx2 := make([]*core.TXrelay, 0)
 	p.Node.CurChain.Tx_pool.Relaypoollock.Lock()
