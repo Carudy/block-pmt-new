@@ -125,9 +125,11 @@ while IFS= read -r rawline || [ -n "$rawline" ]; do
         continue
     fi
 
-    cfg_args=(--schema "$scheme" --inject-speed "$inject")
-    [ -n "$mcb" ] && cfg_args+=(--max-commit-block "$mcb")
-    [ -n "$mbs" ] && cfg_args+=(--max-block-size "$mbs")
+    	cfg_args=(--schema "$scheme" --inject-speed "$inject")
+    	[ -n "$mcb" ] && cfg_args+=(--max-commit-block "$mcb")
+    	[ -n "$mbs" ] && cfg_args+=(--max-block-size "$mbs")
+    	# 可选：接受“源分片确认不可恢复”的丢交易，让矩阵能跑完（损失仍会记入 drop）
+    	[ "${ALLOW_CONFIRMED_LOSS:-0}" = "1" ] && cfg_args+=(--allow-confirmed-loss)
     if ! ./set_config.sh "${cfg_args[@]}"; then
         echo "!! 跳过：无法应用本次配置（scheme=$scheme inject=$inject mcb=${mcb:-} mbs=${mbs:-}）" >&2
         fail=$((fail + 1)); continue

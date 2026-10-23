@@ -89,6 +89,7 @@ Default `params.Config.Schema` is **`SchemaPreempt`** (old bank version). Experi
 - `MaxEscrowBatchTxs = 0` (unlimited) and `EscrowGapRepairBlocks = 0` (strict) are the paper defaults. With strict gaps a lost tx **stops** the run instead of being skipped; the missing nonce is logged to `S*_escrow_drop.csv` and stdout.
 - reliable delivery for escrow: client injection and shard→shard forwarding carry a `Seq`, the receiver de-duplicates and acks, and the sender retries every 2.5 s (8 tries); relays do the same via `Relay.Seq` / `RelayAck`. Exhausted retries are logged as `relay_lost` in the drop file so the ledger still closes.
 - `run.sh` accepts `RUN_TIMEOUT_SEC`; `run_exp.sh` sets it per row (`EXP_TIMEOUT`, default 900 s) so one stuck row cannot block a batch. Exit code 2 means “timed out”.
+- `EscrowSkipConfirmedLost` (default **false**): when the destination asks the source for a missing nonce and the source confirms it does not have it, the run may skip that nonce. Enable with `./set_config.sh --allow-confirmed-loss` or `ALLOW_CONFIRMED_LOSS=1 ./run_exp.sh ...`; the loss is still written to `S*_escrow_drop.csv` as `reason=lost`. Strict mode (default) keeps the run stalled so the cause can be traced.
 
 **Not implemented (P5):**
 

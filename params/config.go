@@ -145,6 +145,10 @@ type ChainConfig struct {
 	// preempt_escrow：gated nonce 缺口超过该块数后跳过缺失 nonce，避免实验永久卡住。
 	// 0 表示禁用（严格 nonce 语义）。可信原型推荐保留一个有限值。
 	EscrowGapRepairBlocks int
+	// preempt_escrow：当源分片明确回复“这笔交易我这里也没有”时，是否跳过该 nonce
+	// 继续运行。默认 false（严格）：缺口会一直停住，等待人工定位。
+	// 跑批量矩阵且接受“已确认丢失”计入结果时，用 set_config.sh --allow-confirmed-loss 打开。
+	EscrowSkipConfirmedLost bool
 }
 
 // envInt 读取环境变量为 int，失败则返回默认值。
@@ -254,6 +258,7 @@ var (
 		SettlementWaitBlocks:   2,
 		MaxEscrowBatchTxs:      0,
 		EscrowGapRepairBlocks:  0,
+		EscrowSkipConfirmedLost: false,
 	}
 
 	Init_addrs          = []string{}

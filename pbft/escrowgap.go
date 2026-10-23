@@ -116,6 +116,13 @@ func (p *Pbft) handleEscrowGapResp(content []byte) {
 		// 源分片也没有：真丢失。写进 drop 日志，严格模式下仍会停，但原因不再是谜。
 		fmt.Printf("[escrow][lost] mig=%s account=%s nonce=%d (源分片无此交易)\n", r.MigID, rec.Account, r.Nonce)
 		p.Node.CurChain.Tx_pool.RecordLost(rec.Account, r.Nonce, height)
+		if params.Config.EscrowSkipConfirmedLost {
+			// 已由源分片确认不可恢复：显式跳过，让批次能跑完（该笔已在 drop 里记账）。
+			if cur := account.GetLastNonce(rec.Account); cur < r.Nonce {
+				account.SetLastNonce(rec.Account, r.Nonce)
+			}
+			fmt.Printf("[escrow][lost-skip] account=%s nonce=%d (EscrowSkipConfirmedLost)\n", rec.Account, r.Nonce)
+		}
 		return
 	}
 	for _, e := range r.Txs {

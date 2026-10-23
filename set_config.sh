@@ -111,6 +111,27 @@ set_num_val() {
     echo "params/config.go: $key -> $val"
 }
 
+# 布尔字段：只替换生效行的 true/false
+set_bool_val() {
+    local key="$1" val="$2" tmp
+    tmp="$cfg.tmp"
+    perl -e '
+        my ($key, $target) = @ARGV;
+        while (my $line = <STDIN>) {
+            if ($line =~ /^(\s*)(?:\/\/\s*)?(\Q$key\E:\s*)(true|false)/) {
+                $line = $1 . $2 . $target . ",\n";
+            }
+            print $line;
+        }
+    ' "$key" "$val" < "$cfg" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$cfg"
+    if ! grep -Eq "^[[:space:]]*$key:[[:space:]]*$val," "$cfg"; then
+        echo "ERROR: 未能设置 $key=$val（缺少该字段？）" >&2
+        return 1
+    fi
+    echo "params/config.go: $key -> $val"
+}
+
 status=0
 while [ $# -gt 0 ]; do
     opt="$1"; shift
@@ -131,6 +152,10 @@ while [ $# -gt 0 ]; do
             [ $# -ge 1 ] || { echo "ERROR: $opt 缺少参数" >&2; exit 1; }
             set_num_val MaxBlockSize "$1" || status=1
             shift ;;
+        --allow-confirmed-loss)
+            set_bool_val EscrowSkipConfirmedLost true || status=1 ;;
+        --strict-loss)
+            set_bool_val EscrowSkipConfirmedLost false || status=1 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
